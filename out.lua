@@ -1,6 +1,6 @@
 -- ============================================================
 --  lz3s Invasion Menu (v2)
---  Abas: INVASION | TREASURE | CAPSULAS | CONFIG
+--  Abas: INVASION | TREASURE | CAPSULAS | CONFIG | WEBHOOK
 -- ============================================================
 
 local Players           = game:GetService("Players")
@@ -49,7 +49,7 @@ local clearInvasionJoinPrompt = ok_jp and joinPromptStore.clearInvasionJoinPromp
 local getPlayerData            = require(nav(ReplicatedStorage, "src", "common", "store", "players", "datastore")).getPlayerData
 local TREASURE_HUNT_TILE_COUNT = require(nav(ReplicatedStorage, "src", "common", "content", "events", "treasure-hunt")).TREASURE_HUNT_TILE_COUNT
 
--- ===================== MÓDULOS (ITENS - para nome do item) =====================
+-- ===================== MÓDULOS (ITENS) =====================
 local ok_items, itemsContent = pcall(function()
     return require(nav(ReplicatedStorage, "src", "common", "content", "items", "items")).itemsContent
 end)
@@ -86,7 +86,6 @@ local CARD_SEC_ID        = nil
 local KEYBIND_KEYS      = {"RightShift", "K"}
 local KEYBIND_RECORDING = false
 
--- flags de notificação
 local NOTIF_ENABLED        = true
 local NOTIF_INVASION_DISP  = true
 local NOTIF_INVASION_START = true
@@ -107,8 +106,7 @@ do
     if ok and shop then
         for _, candidate in pairs(shop.items or {}) do
             if candidate.id == CAPS_ITEM_ID then
-                capsItemPrice = candidate.price
-                break
+                capsItemPrice = candidate.price; break
             end
         end
     end
@@ -135,13 +133,24 @@ local autoOpenLimit   = 0
 local autoOpenThread  = nil
 local isBuying        = false
 
+-- ===================== ESTADO (WEBHOOK) =====================
+local WEBHOOK_URL         = ""
+local WH_CAPSULE_ENABLED  = true
+local WH_INVASION_ENABLED = true
+
+-- Rastreamento de invasion para webhook
+local invasionStartTime     = nil
+local invasionCardVoteList  = {}
+local invasionPasAntesInicio = 0
+local _lastInvasionForWH    = nil
+
 -- ============================================================
 --  ANTI-AFK
 -- ============================================================
 Players.LocalPlayer.Idled:Connect(function()
-    VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+    VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
     task.wait(0.1)
-    VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+    VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
     logf("Anti-AFK: ping enviado")
 end)
 
@@ -173,7 +182,7 @@ do
     p = p and p:FindFirstChild("container")
     startRemote = p and p:FindFirstChild("lobbies.start")
     if startRemote then
-        logf("Auto Start: remote 'lobbies.start' encontrado (" .. startRemote.ClassName .. ")")
+        logf("Auto Start: remote encontrado (" .. startRemote.ClassName .. ")")
     else
         warn("[lz3s] Auto Start: remote 'lobbies.start' NAO encontrado!")
     end
@@ -187,7 +196,6 @@ RunService.Heartbeat:Connect(function()
     local ok, lobby = pcall(getLobbyByPlayer, USER_KEY)
     if not ok or lobby == nil or lobby.owner ~= USER_KEY then return end
     local count = #(lobby.players or {})
-    logf("Auto Start: " .. count .. "/" .. MIN_PLAYERS)
     if count >= MIN_PLAYERS then
         lastStarted = tick()
         if startRemote ~= nil then
@@ -195,8 +203,10 @@ RunService.Heartbeat:Connect(function()
                 if startRemote:IsA("RemoteEvent") then startRemote:FireServer()
                 elseif startRemote:IsA("RemoteFunction") then startRemote:InvokeServer() end
             end)
-            if okFire then logf("Auto Start: FireServer() enviado!")
-            else logf("Auto Start: erro " .. tostring(errFire)); pcall(function() remotes.lobbies.start:fire() end) end
+            if not okFire then
+                logf("Auto Start: erro " .. tostring(errFire))
+                pcall(function() remotes.lobbies.start:fire() end)
+            end
         else
             pcall(function() remotes.lobbies.start:fire() end)
         end
@@ -267,6 +277,7 @@ subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), functio
         local inv = getInvasionByPlayer(USER_KEY)
         if inv == nil or inv.phase ~= "intermission" then return end
         remotes.invasions.voteCard:fire(cardId)
+        table.insert(invasionCardVoteList, tostring(cardId))
         logf("Auto Card: " .. tostring(cardId))
     end)
 end)
@@ -311,7 +322,7 @@ end)
 -- ============================================================
 --  AUTO JOIN
 -- ============================================================
-local lastJoin = 0
+local lastJoin     = 0
 local triedLobbies = {}
 RunService.Heartbeat:Connect(function()
     if not AUTO_JOIN then return end
@@ -322,7 +333,7 @@ RunService.Heartbeat:Connect(function()
     if not ok or all == nil then return end
     for id, lobby in pairs(all) do
         if lobby.type=="invasion" and not lobby.friendsOnly and not triedLobbies[id] then
-            local max = lobby.maxPlayers or 4
+            local max   = lobby.maxPlayers or 4
             local count = #(lobby.players or {})
             if count < max then
                 lastJoin = tick(); triedLobbies[id] = true
@@ -338,23 +349,19 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
---  AUTO TP  (versão corrigida com ChildAdded)
+--  AUTO TP
 -- ============================================================
 local tpFeitoIds = {}
 
 local function buscarPosTurret(invasionFolder)
-    -- Tenta achar imediatamente
     local turret = invasionFolder:FindFirstChild("Main Base Turret")
     if turret == nil then
-        -- Aguarda até 15s pelo turret aparecer
         local ok, result = pcall(function()
             return invasionFolder:WaitForChild("Main Base Turret", 15)
         end)
         if ok and result then turret = result end
     end
-    if turret == nil then
-        return nil, "Main Base Turret nao encontrado em " .. invasionFolder.Name
-    end
+    if turret == nil then return nil, "Main Base Turret nao encontrado em " .. invasionFolder.Name end
     if turret:IsA("Model") then
         local pp = turret.PrimaryPart
         if pp then return pp.Position, nil end
@@ -377,30 +384,18 @@ local function tentarTpParaInvasion(filho)
     if not nome:match("^invasion%-.") then return end
     if tpFeitoIds[nome] then return end
     if not AUTO_TP then return end
-
     task.spawn(function()
-        logf("Auto TP: detectei " .. nome .. ", aguardando Main Base Turret...")
+        logf("Auto TP: detectei " .. nome .. ", aguardando turret...")
         local pos, err = buscarPosTurret(filho)
-        if pos == nil then
-            logf("Auto TP ERRO: " .. tostring(err))
-            return
-        end
+        if pos == nil then logf("Auto TP ERRO: " .. tostring(err)); return end
         if not AUTO_TP then return end
-
-        -- Aguarda personagem se necessário
         local char = Players.LocalPlayer.Character
         if char == nil then
-            for _ = 1, 80 do
-                task.wait(0.1)
-                char = Players.LocalPlayer.Character
-                if char then break end
-            end
+            for _ = 1, 80 do task.wait(0.1); char = Players.LocalPlayer.Character; if char then break end end
         end
         if char == nil then return end
-
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if hrp == nil then return end
-
         tpFeitoIds[nome] = true
         hrp.CFrame = CFrame.new(pos + Vector3.new(0, 10, 0))
         logf("Auto TP: teleportado para " .. nome)
@@ -408,34 +403,17 @@ local function tentarTpParaInvasion(filho)
     end)
 end
 
--- Aguarda o Map e monitora via ChildAdded
 task.spawn(function()
     local mapFolder
     local ok = pcall(function()
         local world = workspace:WaitForChild("World", 30)
         mapFolder = world:WaitForChild("Map", 30)
     end)
-    if not ok or mapFolder == nil then
-        warn("[lz3s] Auto TP: workspace.World.Map nao encontrado")
-        return
-    end
-
-    -- Tenta TP para invasions que já existiam ao carregar
-    for _, filho in ipairs(mapFolder:GetChildren()) do
-        tentarTpParaInvasion(filho)
-    end
-
-    -- Detecta novas invasions em tempo real (sem polling)
-    mapFolder.ChildAdded:Connect(function(filho)
-        tentarTpParaInvasion(filho)
-    end)
-
-    -- Limpa IDs quando a invasion é removida, permitindo TP em nova invasion
+    if not ok or mapFolder == nil then warn("[lz3s] Auto TP: workspace.World.Map nao encontrado"); return end
+    for _, filho in ipairs(mapFolder:GetChildren()) do tentarTpParaInvasion(filho) end
+    mapFolder.ChildAdded:Connect(function(filho) tentarTpParaInvasion(filho) end)
     mapFolder.ChildRemoved:Connect(function(filho)
-        if tpFeitoIds[filho.Name] then
-            tpFeitoIds[filho.Name] = nil
-            logf("Auto TP: invasion removida, ID limpo: " .. filho.Name)
-        end
+        if tpFeitoIds[filho.Name] then tpFeitoIds[filho.Name] = nil end
     end)
 end)
 
@@ -473,7 +451,6 @@ local function escolherTileAleatoria()
     return disp[math.random(1, #disp)]
 end
 
--- Retorna o nome de display do item, ou o id se não encontrado
 local function getNomeItem(itemId)
     if itemId == nil then return "?" end
     local content = itemsContent[itemId]
@@ -481,14 +458,11 @@ local function getNomeItem(itemId)
     return tostring(itemId)
 end
 
--- Formata a recompensa de forma legível
 local function formatarRecompensa(reward)
     if reward == nil then return "Item desconhecido" end
-    local nome = getNomeItem(reward.id or reward)
+    local nome   = getNomeItem(reward.id or reward)
     local amount = reward.amount
-    if amount and amount > 1 then
-        return nome .. " x" .. tostring(amount)
-    end
+    if amount and amount > 1 then return nome .. " x" .. tostring(amount) end
     return nome
 end
 
@@ -503,24 +477,15 @@ local function cavarUmaVez()
         else
             if NOTIF_TREASURE then
                 local pasRestantes = getQuantidadeDePas()
-                -- Monta lista de itens revelados
-                local recompensas = {}
+                local recompensas  = {}
                 if r and r.revealed then
                     for _, rev in ipairs(r.revealed) do
-                        if rev and rev.reward then
-                            table.insert(recompensas, formatarRecompensa(rev.reward))
-                        end
+                        if rev and rev.reward then table.insert(recompensas, formatarRecompensa(rev.reward)) end
                     end
                 elseif r and r.reward then
                     table.insert(recompensas, formatarRecompensa(r.reward))
                 end
-
-                local recompensaTexto = #recompensas > 0
-                    and table.concat(recompensas, ", ")
-                    or "Recompensa obtida"
-
-                -- Linha 1: recompensa | Linha 2: pas restantes
-                local msg = recompensaTexto .. "\nPas restantes: " .. pasRestantes
+                local recompensaTexto = #recompensas > 0 and table.concat(recompensas, ", ") or "Recompensa obtida"
                 criarNotifTreasure("Tesouro Cavado", recompensaTexto, pasRestantes)
             end
         end
@@ -577,25 +542,15 @@ local function capsTeleportAndBuy(amount)
     if character == nil then return nil end
     local rootPart = character:FindFirstChild("HumanoidRootPart")
     if rootPart == nil then return nil end
-
     local originalCFrame = rootPart.CFrame
-
     if capsNpcPath then
         local ok, npcCF = pcall(function() return capsNpcPath:GetPivot() end)
-        if ok then
-            rootPart.CFrame = npcCF * CFrame.new(0, 0, 5)
-            task.wait(0.3)
-        end
+        if ok then rootPart.CFrame = npcCF * CFrame.new(0, 0, 5); task.wait(0.3) end
     end
-
     local request = remotes.shops.purchase:request(CAPS_SHOP_NAME, CAPS_ITEM_ID, amount)
-
     request:andThen(function()
-        if rootPart and rootPart.Parent then
-            rootPart.CFrame = originalCFrame
-        end
+        if rootPart and rootPart.Parent then rootPart.CFrame = originalCFrame end
     end)
-
     return request
 end
 
@@ -604,7 +559,7 @@ local function capsBuyMaxOnce()
     local maxAffordable = capsGetMaxAffordable()
     if maxAffordable <= 0 then return false end
     isBuying = true
-    local amount = math.min(maxAffordable, CAPS_MAX_PER_REQ)
+    local amount  = math.min(maxAffordable, CAPS_MAX_PER_REQ)
     local request = capsTeleportAndBuy(amount)
     if request == nil then isBuying = false; return false end
     local success = false
@@ -615,6 +570,89 @@ local function capsBuyMaxOnce()
     return success
 end
 
+-- ============================================================
+--  WEBHOOK — funções core (antes de capsOpenAmount)
+-- ============================================================
+local function wh_getInvTotal(id)
+    local d = getPlayerData(USER_KEY)
+    if d == nil or d.items == nil then return 0 end
+    local e = d.items[id]
+    return e and e.amount or 0
+end
+
+local function wh_footer()
+    return { text = "lz3s Invasion v2" }
+end
+
+local http_req = syn and syn.request or (typeof(request)=="function" and request) or (typeof(http_request)=="function" and http_request) or nil
+
+local function wh_send(payload)
+    if WEBHOOK_URL == "" then return end
+    if http_req == nil then logf("Webhook: executor nao suporta HTTP requests"); return end
+    task.spawn(function()
+        local ok, err = pcall(function()
+            http_req({
+                Url     = WEBHOOK_URL,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = HttpService:JSONEncode(payload),
+            })
+        end)
+        if not ok then logf("Webhook erro: " .. tostring(err)) end
+    end)
+end
+
+local function wh_enviarCapsulas(qtdAberta, resultados)
+    if not WH_CAPSULE_ENABLED or WEBHOOK_URL == "" then return end
+    local agrupado = {}
+    local ordem    = {}
+    if resultados then
+        for _, r in ipairs(resultados) do
+            local id  = (type(r)=="table" and r.id) or tostring(r)
+            local amt = (type(r)=="table" and r.amount) or 1
+            if not agrupado[id] then agrupado[id] = 0; table.insert(ordem, id) end
+            agrupado[id] = agrupado[id] + amt
+        end
+    end
+    local fields = {}
+    for _, id in ipairs(ordem) do
+        local gained = agrupado[id]
+        local total  = wh_getInvTotal(id)
+        table.insert(fields, {
+            name   = "🎁 " .. getNomeItem(id),
+            value  = "**+" .. gained .. "** obtido •  `" .. total .. "` no inventário",
+            inline = false,
+        })
+    end
+    if #fields == 0 then
+        table.insert(fields, { name = "Resultado", value = "_Sem itens registrados_", inline = false })
+    end
+    local still = capsGetOwned()
+    wh_send({ embeds = {{
+        title       = "🔮 Cápsulas Abertas",
+        description = "**" .. qtdAberta .. "** `" .. CAPS_ITEM_ID .. "` abertas — restam **" .. still .. "** no inventário",
+        color       = 0x50BEC8,
+        fields      = fields,
+        footer      = wh_footer(),
+    }}})
+end
+
+-- Extrai lista de drops de um resultado de openCapsule
+local function wh_extrairDropsCapsulas(result)
+    if result == nil then return {} end
+    local lista = {}
+    if result.items then
+        for _, item in ipairs(result.items) do
+            if item and item.id then table.insert(lista, item) end
+        end
+    elseif result.rewards then
+        for _, r in ipairs(result.rewards) do
+            if r and r.id then table.insert(lista, r) end
+        end
+    end
+    return lista
+end
+
 local function capsOpenAmount(amount)
     local owned = capsGetOwned()
     if owned <= 0 or amount <= 0 then return end
@@ -622,6 +660,8 @@ local function capsOpenAmount(amount)
     remotes.items.openCapsule:request(CAPS_ITEM_ID, amount):andThen(function(result)
         if result == nil or result.success ~= true then return end
         logf("Capsulas abertas: " .. tostring(result.opened or amount))
+        local drops = wh_extrairDropsCapsulas(result)
+        wh_enviarCapsulas(result.opened or amount, drops)
     end)
 end
 
@@ -633,9 +673,7 @@ local function capsStartAutoBuyLoop()
     if autoBuyThread ~= nil then return end
     autoBuyThread = task.spawn(function()
         while autoBuyEnabled do
-            if autoBuyLimit > 0 and capsGetCurrency() >= autoBuyLimit then
-                capsBuyMaxOnce()
-            end
+            if autoBuyLimit > 0 and capsGetCurrency() >= autoBuyLimit then capsBuyMaxOnce() end
             task.wait(2)
         end
         autoBuyThread = nil
@@ -646,13 +684,98 @@ local function capsStartAutoOpenLoop()
     if autoOpenThread ~= nil then return end
     autoOpenThread = task.spawn(function()
         while autoOpenEnabled do
-            if autoOpenLimit > 0 and capsGetOwned() >= autoOpenLimit then
-                capsOpenAll()
-            end
+            if autoOpenLimit > 0 and capsGetOwned() >= autoOpenLimit then capsOpenAll() end
             task.wait(2)
         end
         autoOpenThread = nil
     end)
+end
+
+-- ============================================================
+--  WEBHOOK — relatório de invasion
+-- ============================================================
+local function wh_registrarInicioInvasion()
+    invasionStartTime     = tick()
+    invasionCardVoteList  = {}
+    invasionPasAntesInicio = getQuantidadeDePas()
+end
+
+local function somarStarRemnant(invasion)
+    if invasion==nil or invasion.players==nil then return 0 end
+    local dados = invasion.players[USER_KEY]
+    if dados==nil or dados.drops==nil then return 0 end
+    local total = 0
+    local CURRENCY_DROP_NAME = "Summer Star Remnant"
+    for _, drop in ipairs(dados.drops) do
+        if drop and drop.id==CURRENCY_DROP_NAME then total += (drop.amount or 0) end
+    end
+    return total
+end
+
+local function getStarRemnantTotal()
+    local ok, d = pcall(getPlayerData, USER_KEY)
+    if not ok or d==nil or d.items==nil then return nil end
+    local item = d.items["Summer Star Remnant"]
+    return item and item.amount or 0
+end
+
+local function wh_enviarRelatorioInvasion(invasion)
+    if not WH_INVASION_ENABLED or WEBHOOK_URL == "" then return end
+    if invasionStartTime == nil then return end
+
+    local durSecs = math.floor(tick() - invasionStartTime)
+    local durTxt  = math.floor(durSecs/60) .. "m " .. (durSecs%60) .. "s"
+
+    -- Drops
+    local dropFields = {}
+    if invasion and invasion.players then
+        local dados = invasion.players[USER_KEY]
+        if dados and dados.drops then
+            local agrupado = {}
+            local ordem    = {}
+            for _, drop in ipairs(dados.drops) do
+                if drop and drop.id then
+                    if not agrupado[drop.id] then agrupado[drop.id] = 0; table.insert(ordem, drop.id) end
+                    agrupado[drop.id] = agrupado[drop.id] + (drop.amount or 1)
+                end
+            end
+            for _, id in ipairs(ordem) do
+                table.insert(dropFields, {
+                    name   = "💧 " .. getNomeItem(id),
+                    value  = "**+" .. agrupado[id] .. "** • `" .. wh_getInvTotal(id) .. "` no inv.",
+                    inline = true,
+                })
+            end
+        end
+    end
+    if #dropFields == 0 then
+        table.insert(dropFields, { name = "Drops", value = "_Nenhum item dropado_", inline = false })
+    end
+
+    local pasUsadas  = math.max(0, invasionPasAntesInicio - getQuantidadeDePas())
+    local cartasTxt  = #invasionCardVoteList > 0 and table.concat(invasionCardVoteList, " → ") or "_Nenhuma_"
+    local numJogs    = 0
+    if invasion and invasion.players then for _ in pairs(invasion.players) do numJogs += 1 end end
+    local starsGanhas = somarStarRemnant(invasion)
+    local starTotal   = getStarRemnantTotal() or 0
+
+    local desc = "✅ **Concluída**\n"
+              .. "⏱ Duração: **" .. durTxt .. "**\n"
+              .. "👥 Jogadores: **" .. numJogs .. "**\n"
+              .. "⭐ Stars: **+" .. starsGanhas .. "** • total `" .. starTotal .. "`\n"
+              .. "⛏ Pás cavadas: **" .. pasUsadas .. "**"
+
+    local allFields = {{ name = "🃏 Cartas votadas", value = cartasTxt, inline = false }}
+    for _, f in ipairs(dropFields) do table.insert(allFields, f) end
+
+    wh_send({ embeds = {{
+        title       = "⚔️ " .. (invasion and invasion.name or "Invasion") .. " — Relatório",
+        description = desc,
+        color       = 0x50C878,
+        fields      = allFields,
+        footer      = wh_footer(),
+    }}})
+    invasionStartTime = nil
 end
 
 -- ============================================================
@@ -673,6 +796,9 @@ local function montarConfigAtual()
         NOTIF_INVASION_DISP=NOTIF_INVASION_DISP, NOTIF_INVASION_START=NOTIF_INVASION_START,
         NOTIF_INVASION_END=NOTIF_INVASION_END, NOTIF_ENTROU=NOTIF_ENTROU,
         NOTIF_TP=NOTIF_TP, NOTIF_TREASURE=NOTIF_TREASURE,
+        WEBHOOK_URL=WEBHOOK_URL,
+        WH_CAPSULE_ENABLED=WH_CAPSULE_ENABLED,
+        WH_INVASION_ENABLED=WH_INVASION_ENABLED,
     }
 end
 
@@ -736,32 +862,34 @@ function criarNotif(tipo, titulo, msg, duracao)
     frame.Size=UDim2.fromOffset(NOTIF_W,NOTIF_H)
     frame.Position=UDim2.new(1,NOTIF_W+20,1,-(NOTIF_PAD_B+NOTIF_H))
     frame.BackgroundColor3=Color3.fromRGB(18,17,26); frame.BorderSizePixel=0; frame.Parent=notifGui
-    local fc=Instance.new("UICorner"); fc.CornerRadius=UDim.new(0,10); fc.Parent=frame
-    local fs=Instance.new("UIStroke"); fs.Color=Color3.fromRGB(55,45,90); fs.Thickness=1; fs.Parent=frame
-    local bar=Instance.new("Frame"); bar.Size=UDim2.new(0,4,1,-16); bar.Position=UDim2.fromOffset(0,8)
-    bar.BackgroundColor3=def.bar; bar.BorderSizePixel=0; bar.Parent=frame
-    local bc=Instance.new("UICorner"); bc.CornerRadius=UDim.new(0,4); bc.Parent=bar
-    local dot=Instance.new("Frame"); dot.Size=UDim2.fromOffset(8,8); dot.Position=UDim2.fromOffset(20,14)
-    dot.BackgroundColor3=def.bar; dot.BorderSizePixel=0; dot.Parent=frame
-    local dc=Instance.new("UICorner"); dc.CornerRadius=UDim.new(1,0); dc.Parent=dot
-    local tLbl=Instance.new("TextLabel"); tLbl.Size=UDim2.new(1,-44,0,18); tLbl.Position=UDim2.fromOffset(40,10)
-    tLbl.BackgroundTransparency=1; tLbl.Text=titulo; tLbl.TextColor3=Color3.fromRGB(230,225,250)
-    tLbl.TextSize=13; tLbl.Font=Enum.Font.GothamBold; tLbl.TextXAlignment=Enum.TextXAlignment.Left
-    tLbl.TextTruncate=Enum.TextTruncate.AtEnd; tLbl.Parent=frame
-    local mLbl=Instance.new("TextLabel"); mLbl.Size=UDim2.new(1,-52,0,28); mLbl.Position=UDim2.fromOffset(40,28)
-    mLbl.BackgroundTransparency=1; mLbl.Text=msg; mLbl.TextColor3=Color3.fromRGB(160,155,185)
-    mLbl.TextSize=11; mLbl.Font=Enum.Font.Gotham; mLbl.TextXAlignment=Enum.TextXAlignment.Left
-    mLbl.TextWrapped=true; mLbl.Parent=frame
-    local pBg=Instance.new("Frame"); pBg.Size=UDim2.new(1,-16,0,2); pBg.Position=UDim2.new(0,8,1,-6)
-    pBg.BackgroundColor3=Color3.fromRGB(40,38,58); pBg.BorderSizePixel=0; pBg.Parent=frame
-    local pgc=Instance.new("UICorner"); pgc.CornerRadius=UDim.new(1,0); pgc.Parent=pBg
-    local prog=Instance.new("Frame"); prog.Size=UDim2.fromScale(1,1); prog.BackgroundColor3=def.bar
-    prog.BorderSizePixel=0; prog.Parent=pBg
-    local prc=Instance.new("UICorner"); prc.CornerRadius=UDim.new(1,0); prc.Parent=prog
-    TweenService:Create(frame,TweenInfo.new(0.3,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{
-        Position=UDim2.new(1,-(NOTIF_W+NOTIF_PAD_R),1,-(NOTIF_PAD_B+NOTIF_H))
-    }):Play()
-    TweenService:Create(prog,TweenInfo.new(duracao,Enum.EasingStyle.Linear),{Size=UDim2.fromScale(0,1)}):Play()
+    do
+        local fc=Instance.new("UICorner"); fc.CornerRadius=UDim.new(0,10); fc.Parent=frame
+        local fs=Instance.new("UIStroke"); fs.Color=Color3.fromRGB(55,45,90); fs.Thickness=1; fs.Parent=frame
+        local bar=Instance.new("Frame"); bar.Size=UDim2.new(0,4,1,-16); bar.Position=UDim2.fromOffset(0,8)
+        bar.BackgroundColor3=def.bar; bar.BorderSizePixel=0; bar.Parent=frame
+        Instance.new("UICorner", bar).CornerRadius=UDim.new(0,4)
+        local dot=Instance.new("Frame"); dot.Size=UDim2.fromOffset(8,8); dot.Position=UDim2.fromOffset(20,14)
+        dot.BackgroundColor3=def.bar; dot.BorderSizePixel=0; dot.Parent=frame
+        Instance.new("UICorner", dot).CornerRadius=UDim.new(1,0)
+        local tLbl=Instance.new("TextLabel"); tLbl.Size=UDim2.new(1,-44,0,18); tLbl.Position=UDim2.fromOffset(40,10)
+        tLbl.BackgroundTransparency=1; tLbl.Text=titulo; tLbl.TextColor3=Color3.fromRGB(230,225,250)
+        tLbl.TextSize=13; tLbl.Font=Enum.Font.GothamBold; tLbl.TextXAlignment=Enum.TextXAlignment.Left
+        tLbl.TextTruncate=Enum.TextTruncate.AtEnd; tLbl.Parent=frame
+        local mLbl=Instance.new("TextLabel"); mLbl.Size=UDim2.new(1,-52,0,28); mLbl.Position=UDim2.fromOffset(40,28)
+        mLbl.BackgroundTransparency=1; mLbl.Text=msg; mLbl.TextColor3=Color3.fromRGB(160,155,185)
+        mLbl.TextSize=11; mLbl.Font=Enum.Font.Gotham; mLbl.TextXAlignment=Enum.TextXAlignment.Left
+        mLbl.TextWrapped=true; mLbl.Parent=frame
+        local pBg=Instance.new("Frame"); pBg.Size=UDim2.new(1,-16,0,2); pBg.Position=UDim2.new(0,8,1,-6)
+        pBg.BackgroundColor3=Color3.fromRGB(40,38,58); pBg.BorderSizePixel=0; pBg.Parent=frame
+        Instance.new("UICorner", pBg).CornerRadius=UDim.new(1,0)
+        local prog=Instance.new("Frame"); prog.Size=UDim2.fromScale(1,1); prog.BackgroundColor3=def.bar
+        prog.BorderSizePixel=0; prog.Parent=pBg
+        Instance.new("UICorner", prog).CornerRadius=UDim.new(1,0)
+        TweenService:Create(frame,TweenInfo.new(0.3,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{
+            Position=UDim2.new(1,-(NOTIF_W+NOTIF_PAD_R),1,-(NOTIF_PAD_B+NOTIF_H))
+        }):Play()
+        TweenService:Create(prog,TweenInfo.new(duracao,Enum.EasingStyle.Linear),{Size=UDim2.fromScale(0,1)}):Play()
+    end
     task.delay(duracao, function()
         TweenService:Create(frame,TweenInfo.new(0.25,Enum.EasingStyle.Quint,Enum.EasingDirection.In),{
             Position=UDim2.new(1,NOTIF_W+20,1,-(NOTIF_PAD_B+NOTIF_H))
@@ -771,109 +899,80 @@ function criarNotif(tipo, titulo, msg, duracao)
 end
 
 -- ============================================================
---  NOTIFICAÇÃO ESPECIAL DE TREASURE (maior, com item em destaque)
+--  NOTIFICAÇÃO TREASURE
 -- ============================================================
--- Altura maior para caber mais info
 local TNOTIF_W = 290
 local TNOTIF_H = 78
 
 function criarNotifTreasure(titulo, itemTexto, pasRestantes)
     if not NOTIF_ENABLED or not NOTIF_TREASURE then return end
     local duracao = 3.5
-
-    -- Empurra notifs existentes para cima
     for _, slot in ipairs(notifGui:GetChildren()) do
         if slot:IsA("Frame") then
             TweenService:Create(slot, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {
-                Position = UDim2.new(1, slot.Position.X.Offset, 1, slot.Position.Y.Offset - (TNOTIF_H + NOTIF_GAP))
+                Position = UDim2.new(1, slot.Position.X.Offset, 1, slot.Position.Y.Offset-(TNOTIF_H+NOTIF_GAP))
             }):Play()
         end
     end
-
-    local BAR_COLOR  = Color3.fromRGB(220, 170, 40)   -- dourado
-    local ITEM_COLOR = Color3.fromRGB(255, 220, 80)    -- amarelo claro para o item
-    local PAS_COLOR  = Color3.fromRGB(140, 215, 140)   -- verde suave para as pas
-
+    local BAR_COLOR  = Color3.fromRGB(220,170,40)
+    local ITEM_COLOR = Color3.fromRGB(255,220,80)
+    local PAS_COLOR  = Color3.fromRGB(140,215,140)
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.fromOffset(TNOTIF_W, TNOTIF_H)
-    frame.Position = UDim2.new(1, TNOTIF_W + 20, 1, -(NOTIF_PAD_B + TNOTIF_H))
-    frame.BackgroundColor3 = Color3.fromRGB(20, 18, 10)
-    frame.BorderSizePixel = 0
-    frame.Parent = notifGui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
-    local fs = Instance.new("UIStroke", frame)
-    fs.Color = Color3.fromRGB(100, 75, 20); fs.Thickness = 1
-
-    -- Barra lateral dourada
-    local bar = Instance.new("Frame", frame)
-    bar.Size = UDim2.new(0, 4, 1, -16); bar.Position = UDim2.fromOffset(0, 8)
-    bar.BackgroundColor3 = BAR_COLOR; bar.BorderSizePixel = 0
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 4)
-
-    -- Ícone (pá) - círculo dourado
-    local dot = Instance.new("Frame", frame)
-    dot.Size = UDim2.fromOffset(10, 10); dot.Position = UDim2.fromOffset(18, 12)
-    dot.BackgroundColor3 = BAR_COLOR; dot.BorderSizePixel = 0
-    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
-
-    -- Título "Tesouro Cavado"
-    local tLbl = Instance.new("TextLabel", frame)
-    tLbl.Size = UDim2.new(1, -44, 0, 16); tLbl.Position = UDim2.fromOffset(38, 8)
-    tLbl.BackgroundTransparency = 1; tLbl.Text = titulo
-    tLbl.TextColor3 = Color3.fromRGB(240, 220, 160)
-    tLbl.TextSize = 12; tLbl.Font = Enum.Font.GothamBold
-    tLbl.TextXAlignment = Enum.TextXAlignment.Left
-    tLbl.TextTruncate = Enum.TextTruncate.AtEnd
-
-    -- Item obtido (destaque em dourado/amarelo)
-    local itemLbl = Instance.new("TextLabel", frame)
-    itemLbl.Size = UDim2.new(1, -44, 0, 20); itemLbl.Position = UDim2.fromOffset(38, 26)
-    itemLbl.BackgroundTransparency = 1
-    -- Trunca para não explodir o card se o nome for longo
-    local itemTextoCurto = #itemTexto > 30 and itemTexto:sub(1, 28) .. "…" or itemTexto
-    itemLbl.Text = "⬥ " .. itemTextoCurto
-    itemLbl.TextColor3 = ITEM_COLOR
-    itemLbl.TextSize = 13; itemLbl.Font = Enum.Font.GothamBold
-    itemLbl.TextXAlignment = Enum.TextXAlignment.Left
-    itemLbl.TextTruncate = Enum.TextTruncate.AtEnd
-
-    -- Pas restantes
-    local pasLbl = Instance.new("TextLabel", frame)
-    pasLbl.Size = UDim2.new(1, -44, 0, 14); pasLbl.Position = UDim2.fromOffset(38, 50)
-    pasLbl.BackgroundTransparency = 1
-    pasLbl.Text = "Pás restantes: " .. tostring(pasRestantes)
-    pasLbl.TextColor3 = PAS_COLOR
-    pasLbl.TextSize = 11; pasLbl.Font = Enum.Font.Gotham
-    pasLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    -- Barra de progresso
-    local pBg = Instance.new("Frame", frame)
-    pBg.Size = UDim2.new(1, -16, 0, 2); pBg.Position = UDim2.new(0, 8, 1, -5)
-    pBg.BackgroundColor3 = Color3.fromRGB(50, 40, 10); pBg.BorderSizePixel = 0
-    Instance.new("UICorner", pBg).CornerRadius = UDim.new(1, 0)
-    local prog = Instance.new("Frame", pBg)
-    prog.Size = UDim2.fromScale(1, 1); prog.BackgroundColor3 = BAR_COLOR; prog.BorderSizePixel = 0
-    Instance.new("UICorner", prog).CornerRadius = UDim.new(1, 0)
-
-    -- Slide in
-    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
-        Position = UDim2.new(1, -(TNOTIF_W + NOTIF_PAD_R), 1, -(NOTIF_PAD_B + TNOTIF_H))
-    }):Play()
-    TweenService:Create(prog, TweenInfo.new(duracao, Enum.EasingStyle.Linear), {
-        Size = UDim2.fromScale(0, 1)
-    }):Play()
-
-    -- Slide out
-    task.delay(duracao, function()
-        TweenService:Create(frame, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
-            Position = UDim2.new(1, TNOTIF_W + 20, 1, -(NOTIF_PAD_B + TNOTIF_H))
+    frame.Size=UDim2.fromOffset(TNOTIF_W,TNOTIF_H)
+    frame.Position=UDim2.new(1,TNOTIF_W+20,1,-(NOTIF_PAD_B+TNOTIF_H))
+    frame.BackgroundColor3=Color3.fromRGB(20,18,10); frame.BorderSizePixel=0; frame.Parent=notifGui
+    do
+        Instance.new("UICorner",frame).CornerRadius=UDim.new(0,10)
+        local fs=Instance.new("UIStroke",frame); fs.Color=Color3.fromRGB(100,75,20); fs.Thickness=1
+        local bar=Instance.new("Frame",frame)
+        bar.Size=UDim2.new(0,4,1,-16); bar.Position=UDim2.fromOffset(0,8)
+        bar.BackgroundColor3=BAR_COLOR; bar.BorderSizePixel=0
+        Instance.new("UICorner",bar).CornerRadius=UDim.new(0,4)
+        local dot=Instance.new("Frame",frame)
+        dot.Size=UDim2.fromOffset(10,10); dot.Position=UDim2.fromOffset(18,12)
+        dot.BackgroundColor3=BAR_COLOR; dot.BorderSizePixel=0
+        Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+        local tLbl=Instance.new("TextLabel",frame)
+        tLbl.Size=UDim2.new(1,-44,0,16); tLbl.Position=UDim2.fromOffset(38,8)
+        tLbl.BackgroundTransparency=1; tLbl.Text=titulo
+        tLbl.TextColor3=Color3.fromRGB(240,220,160)
+        tLbl.TextSize=12; tLbl.Font=Enum.Font.GothamBold
+        tLbl.TextXAlignment=Enum.TextXAlignment.Left; tLbl.TextTruncate=Enum.TextTruncate.AtEnd
+        local itemLbl=Instance.new("TextLabel",frame)
+        itemLbl.Size=UDim2.new(1,-44,0,20); itemLbl.Position=UDim2.fromOffset(38,26)
+        itemLbl.BackgroundTransparency=1
+        local ct = #itemTexto>30 and itemTexto:sub(1,28).."…" or itemTexto
+        itemLbl.Text="⬥ "..ct; itemLbl.TextColor3=ITEM_COLOR
+        itemLbl.TextSize=13; itemLbl.Font=Enum.Font.GothamBold
+        itemLbl.TextXAlignment=Enum.TextXAlignment.Left; itemLbl.TextTruncate=Enum.TextTruncate.AtEnd
+        local pasLbl=Instance.new("TextLabel",frame)
+        pasLbl.Size=UDim2.new(1,-44,0,14); pasLbl.Position=UDim2.fromOffset(38,50)
+        pasLbl.BackgroundTransparency=1; pasLbl.Text="Pás restantes: "..tostring(pasRestantes)
+        pasLbl.TextColor3=PAS_COLOR; pasLbl.TextSize=11; pasLbl.Font=Enum.Font.Gotham
+        pasLbl.TextXAlignment=Enum.TextXAlignment.Left
+        local pBg=Instance.new("Frame",frame)
+        pBg.Size=UDim2.new(1,-16,0,2); pBg.Position=UDim2.new(0,8,1,-5)
+        pBg.BackgroundColor3=Color3.fromRGB(50,40,10); pBg.BorderSizePixel=0
+        Instance.new("UICorner",pBg).CornerRadius=UDim.new(1,0)
+        local prog=Instance.new("Frame",pBg)
+        prog.Size=UDim2.fromScale(1,1); prog.BackgroundColor3=BAR_COLOR; prog.BorderSizePixel=0
+        Instance.new("UICorner",prog).CornerRadius=UDim.new(1,0)
+        TweenService:Create(frame,TweenInfo.new(0.3,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{
+            Position=UDim2.new(1,-(TNOTIF_W+NOTIF_PAD_R),1,-(NOTIF_PAD_B+TNOTIF_H))
         }):Play()
-        task.wait(0.3)
-        frame:Destroy()
+        TweenService:Create(prog,TweenInfo.new(duracao,Enum.EasingStyle.Linear),{Size=UDim2.fromScale(0,1)}):Play()
+    end
+    task.delay(duracao, function()
+        TweenService:Create(frame,TweenInfo.new(0.25,Enum.EasingStyle.Quint,Enum.EasingDirection.In),{
+            Position=UDim2.new(1,TNOTIF_W+20,1,-(NOTIF_PAD_B+TNOTIF_H))
+        }):Play()
+        task.wait(0.3); frame:Destroy()
     end)
 end
 
--- Watchers de notificação de lobby
+-- ============================================================
+--  Watchers notificação de lobby
+-- ============================================================
 local jaNotifoiLobby = {}
 task.spawn(function()
     while true do
@@ -893,53 +992,59 @@ task.spawn(function()
     end
 end)
 
-local CURRENCY_DROP_NAME = "Summer Star Remnant"
-local function somarStarRemnant(invasion)
-    if invasion==nil or invasion.players==nil then return 0 end
-    local dados = invasion.players[USER_KEY]
-    if dados==nil or dados.drops==nil then return 0 end
-    local total = 0
-    for _, drop in ipairs(dados.drops) do
-        if drop and drop.id==CURRENCY_DROP_NAME then total += (drop.amount or 0) end
-    end
-    return total
-end
-local function getStarRemnantTotal()
-    local ok, d = pcall(getPlayerData, USER_KEY)
-    if not ok or d==nil or d.items==nil then return nil end
-    local item = d.items[CURRENCY_DROP_NAME]
-    return item and item.amount or 0
-end
+-- ============================================================
+--  Watcher principal de invasion (notifs + webhook)
+-- ============================================================
+local lastInvasionId   = nil
+local lastState        = nil
+local startNotifiedId  = nil
+local lastStarQtd      = 0
 
-local lastInvasionId=nil; local lastState=nil; local startNotifiedId=nil; local lastStarQtd=0
 subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), function(invasion)
-    if invasion==nil then
-        if lastInvasionId~=nil and NOTIF_INVASION_END then
-            local msg="A invasion terminou."
-            if lastStarQtd>0 then
-                msg=msg.." Ganhou: "..lastStarQtd
-                local total=getStarRemnantTotal()
-                if total~=nil then msg=msg.." | Total: "..total end
+    if invasion == nil then
+        -- Invasion terminou
+        if lastInvasionId ~= nil then
+            if NOTIF_INVASION_END then
+                local msg = "A invasion terminou."
+                if lastStarQtd > 0 then
+                    msg = msg .. " Ganhou: " .. lastStarQtd
+                    local total = getStarRemnantTotal()
+                    if total ~= nil then msg = msg .. " | Total: " .. total end
+                end
+                criarNotif("finish","Invasion encerrada",msg,7)
             end
-            criarNotif("finish","Invasion encerrada",msg,7)
+            -- Envia relatório webhook com o snapshot salvo
+            if _lastInvasionForWH then
+                wh_enviarRelatorioInvasion(_lastInvasionForWH)
+            end
         end
-        lastInvasionId=nil; lastState=nil; startNotifiedId=nil; lastStarQtd=0
+        lastInvasionId    = nil
+        lastState         = nil
+        startNotifiedId   = nil
+        lastStarQtd       = 0
+        _lastInvasionForWH = nil
         return
     end
-    lastStarQtd=somarStarRemnant(invasion)
-    if invasion.id~=lastInvasionId then
-        lastInvasionId=invasion.id
+
+    -- Salva snapshot para usar quando invasion sumir
+    _lastInvasionForWH = invasion
+    lastStarQtd = somarStarRemnant(invasion)
+
+    if invasion.id ~= lastInvasionId then
+        lastInvasionId = invasion.id
+        wh_registrarInicioInvasion()
         if NOTIF_ENTROU then criarNotif("entrou","Entrou na invasion",invasion.name or "Dark Matter Invasion",4) end
     end
-    local state=invasion.state
-    if state~=lastState then
-        if lastState=="lobby" and state~="lobby" then
-            if NOTIF_INVASION_START and startNotifiedId~=invasion.id then
-                startNotifiedId=invasion.id
+
+    local state = invasion.state
+    if state ~= lastState then
+        if lastState == "lobby" and state ~= "lobby" then
+            if NOTIF_INVASION_START and startNotifiedId ~= invasion.id then
+                startNotifiedId = invasion.id
                 criarNotif("start","Invasion comecou","Boa sorte na batalha.",4)
             end
         end
-        lastState=state
+        lastState = state
     end
 end)
 
@@ -1008,8 +1113,11 @@ do
     closeBtn.Text="X"; closeBtn.TextColor3=Color3.fromRGB(255,255,255)
     closeBtn.Font=Enum.Font.GothamBold; closeBtn.TextScaled=true
     closeBtn.ZIndex=3; closeBtn.AutoButtonColor=true; closeBtn.Parent=bg
-    local cc=Instance.new("UICorner"); cc.CornerRadius=UDim.new(1,0); cc.Parent=closeBtn
-    local cs=Instance.new("UIStroke"); cs.Color=Color3.fromRGB(255,255,255); cs.Thickness=1.2; cs.Transparency=0.3; cs.Parent=closeBtn
+    do
+        local cc=Instance.new("UICorner"); cc.CornerRadius=UDim.new(1,0); cc.Parent=closeBtn
+        local cs=Instance.new("UIStroke"); cs.Color=Color3.fromRGB(255,255,255); cs.Thickness=1.2
+        cs.Transparency=0.3; cs.Parent=closeBtn
+    end
 
     setBlackScreen=function(v)
         BLACK_SCREEN=v; blackScreenGui.Enabled=v
@@ -1050,18 +1158,20 @@ corner(Frame,14); stroke(Frame,PALETTE.accentDim,1.5)
 -- TitleBar
 local TitleBar=Instance.new("Frame"); TitleBar.Size=UDim2.new(1,0,0,44)
 TitleBar.BackgroundColor3=PALETTE.titlebar; TitleBar.BorderSizePixel=0; TitleBar.Parent=Frame; corner(TitleBar,14)
-local patch=Instance.new("Frame"); patch.Size=UDim2.new(1,0,0,14); patch.Position=UDim2.new(0,0,1,-14)
-patch.BackgroundColor3=PALETTE.titlebar; patch.BorderSizePixel=0; patch.Parent=TitleBar
-local TitleDot=Instance.new("Frame"); TitleDot.Size=UDim2.fromOffset(8,8); TitleDot.Position=UDim2.fromOffset(14,18)
-TitleDot.BackgroundColor3=PALETTE.accent; TitleDot.BorderSizePixel=0; TitleDot.Parent=TitleBar; corner(TitleDot,4)
-local TitleLbl=Instance.new("TextLabel"); TitleLbl.Size=UDim2.new(1,-160,1,0); TitleLbl.Position=UDim2.fromOffset(32,0)
-TitleLbl.BackgroundTransparency=1; TitleLbl.Text="lz3s Invasion"; TitleLbl.TextColor3=PALETTE.textMain
-TitleLbl.TextSize=16; TitleLbl.Font=Enum.Font.GothamBold; TitleLbl.TextXAlignment=Enum.TextXAlignment.Left; TitleLbl.Parent=TitleBar
-local AfkDot=Instance.new("Frame"); AfkDot.Size=UDim2.fromOffset(8,8); AfkDot.Position=UDim2.new(1,-96,0.5,-4)
-AfkDot.BackgroundColor3=Color3.fromRGB(90,220,130); AfkDot.BorderSizePixel=0; AfkDot.Parent=TitleBar; corner(AfkDot,4)
-local AfkLbl=Instance.new("TextLabel"); AfkLbl.Size=UDim2.fromOffset(78,20); AfkLbl.Position=UDim2.new(1,-84,0.5,-10)
-AfkLbl.BackgroundTransparency=1; AfkLbl.Text="Anti-AFK"; AfkLbl.TextColor3=Color3.fromRGB(150,220,170)
-AfkLbl.TextSize=11; AfkLbl.Font=Enum.Font.GothamBold; AfkLbl.TextXAlignment=Enum.TextXAlignment.Left; AfkLbl.Parent=TitleBar
+do
+    local patch=Instance.new("Frame"); patch.Size=UDim2.new(1,0,0,14); patch.Position=UDim2.new(0,0,1,-14)
+    patch.BackgroundColor3=PALETTE.titlebar; patch.BorderSizePixel=0; patch.Parent=TitleBar
+    local TitleDot=Instance.new("Frame"); TitleDot.Size=UDim2.fromOffset(8,8); TitleDot.Position=UDim2.fromOffset(14,18)
+    TitleDot.BackgroundColor3=PALETTE.accent; TitleDot.BorderSizePixel=0; TitleDot.Parent=TitleBar; corner(TitleDot,4)
+    local TitleLbl=Instance.new("TextLabel"); TitleLbl.Size=UDim2.new(1,-160,1,0); TitleLbl.Position=UDim2.fromOffset(32,0)
+    TitleLbl.BackgroundTransparency=1; TitleLbl.Text="lz3s Invasion"; TitleLbl.TextColor3=PALETTE.textMain
+    TitleLbl.TextSize=16; TitleLbl.Font=Enum.Font.GothamBold; TitleLbl.TextXAlignment=Enum.TextXAlignment.Left; TitleLbl.Parent=TitleBar
+    local AfkDot=Instance.new("Frame"); AfkDot.Size=UDim2.fromOffset(8,8); AfkDot.Position=UDim2.new(1,-96,0.5,-4)
+    AfkDot.BackgroundColor3=Color3.fromRGB(90,220,130); AfkDot.BorderSizePixel=0; AfkDot.Parent=TitleBar; corner(AfkDot,4)
+    local AfkLbl=Instance.new("TextLabel"); AfkLbl.Size=UDim2.fromOffset(78,20); AfkLbl.Position=UDim2.new(1,-84,0.5,-10)
+    AfkLbl.BackgroundTransparency=1; AfkLbl.Text="Anti-AFK"; AfkLbl.TextColor3=Color3.fromRGB(150,220,170)
+    AfkLbl.TextSize=11; AfkLbl.Font=Enum.Font.GothamBold; AfkLbl.TextXAlignment=Enum.TextXAlignment.Left; AfkLbl.Parent=TitleBar
+end
 local MinimizeBtn=Instance.new("TextButton"); MinimizeBtn.Size=UDim2.fromOffset(28,28)
 MinimizeBtn.Position=UDim2.new(1,-34,0.5,-14); MinimizeBtn.BackgroundColor3=Color3.fromRGB(50,35,95)
 MinimizeBtn.BorderSizePixel=0; MinimizeBtn.Text="-"; MinimizeBtn.TextColor3=PALETTE.textMain
@@ -1070,10 +1180,12 @@ MinimizeBtn.Font=Enum.Font.GothamBold; MinimizeBtn.TextSize=16; MinimizeBtn.Pare
 -- Abas
 local TabBar=Instance.new("Frame"); TabBar.Size=UDim2.new(1,-24,0,36); TabBar.Position=UDim2.fromOffset(12,54)
 TabBar.BackgroundColor3=PALETTE.panel; TabBar.BorderSizePixel=0; TabBar.Parent=Frame; corner(TabBar,10)
-local tp=Instance.new("UIPadding"); tp.PaddingLeft=UDim.new(0,4); tp.PaddingRight=UDim.new(0,4)
-tp.PaddingTop=UDim.new(0,4); tp.PaddingBottom=UDim.new(0,4); tp.Parent=TabBar
-local tll=Instance.new("UIListLayout"); tll.FillDirection=Enum.FillDirection.Horizontal
-tll.Padding=UDim.new(0,3); tll.SortOrder=Enum.SortOrder.LayoutOrder; tll.Parent=TabBar
+do
+    local tp2=Instance.new("UIPadding"); tp2.PaddingLeft=UDim.new(0,4); tp2.PaddingRight=UDim.new(0,4)
+    tp2.PaddingTop=UDim.new(0,4); tp2.PaddingBottom=UDim.new(0,4); tp2.Parent=TabBar
+    local tll=Instance.new("UIListLayout"); tll.FillDirection=Enum.FillDirection.Horizontal
+    tll.Padding=UDim.new(0,3); tll.SortOrder=Enum.SortOrder.LayoutOrder; tll.Parent=TabBar
+end
 
 local PagesHolder=Instance.new("ScrollingFrame")
 PagesHolder.Size=UDim2.new(1,-24,1,-102); PagesHolder.Position=UDim2.fromOffset(12,98)
@@ -1087,6 +1199,7 @@ local PAGE_DEFS = {
     {key="TREASURE", label="Treasure"},
     {key="CAPSULAS", label="Capsulas"},
     {key="CONFIG",   label="Config"},
+    {key="WEBHOOK",  label="Webhook"},
 }
 local pageFrames = {}
 local tabButtons = {}
@@ -1104,7 +1217,7 @@ for i,def in ipairs(PAGE_DEFS) do
     btn.Size=UDim2.new(1/#PAGE_DEFS,-3,1,0); btn.LayoutOrder=i
     btn.BackgroundColor3=PALETTE.panel; btn.BorderSizePixel=0
     btn.Text=def.label; btn.TextColor3=PALETTE.textDim
-    btn.TextSize=12; btn.Font=Enum.Font.GothamBold; btn.Parent=TabBar
+    btn.TextSize=11; btn.Font=Enum.Font.GothamBold; btn.Parent=TabBar
     corner(btn,7); tabButtons[def.key]=btn
     local page=Instance.new("Frame"); page.Name=def.key
     page.Size=UDim2.new(1,0,0,0); page.AutomaticSize=Enum.AutomaticSize.Y
@@ -1113,7 +1226,7 @@ for i,def in ipairs(PAGE_DEFS) do
     btn.MouseButton1Click:Connect(function() selectTab(def.key) end)
 end
 
--- ── widget helpers ──────────────────────────────────────────────────────────
+-- ── widget helpers ───────────────────────────────────────────
 local function sectionHeader(parent,posY,text)
     local lbl=Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,0,20); lbl.Position=UDim2.fromOffset(0,posY)
     lbl.BackgroundTransparency=1; lbl.Text=text; lbl.TextColor3=PALETTE.accent
@@ -1240,30 +1353,32 @@ do
     invasionSetters.AUTO_JOIN=s4; y=y+44
     local _,s5=makeToggle(p,y,"Auto TP",function(v) AUTO_TP=v end)
     invasionSetters.AUTO_TP=s5; y=y+44
+end
 
-    y=y+4
+do
+    local p=pageFrames["INVASION"]; local y=290
     do
         local lbl=Instance.new("TextLabel"); lbl.Size=UDim2.fromOffset(220,30); lbl.Position=UDim2.fromOffset(0,y)
         lbl.BackgroundTransparency=1; lbl.Text="Min jogadores p/ Auto Start:  "..MIN_PLAYERS
         lbl.TextColor3=PALETTE.textMain; lbl.TextSize=12; lbl.Font=Enum.Font.Gotham
         lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.Parent=p
         local function updLbl() lbl.Text="Min jogadores p/ Auto Start:  "..MIN_PLAYERS end
-        local function makeSideBtn(offX,lbText,fn)
-            local b=Instance.new("TextButton"); b.Size=UDim2.fromOffset(34,28); b.Position=UDim2.fromOffset(offX,y+1)
-            b.BackgroundColor3=PALETTE.accentDim; b.BorderSizePixel=0; b.Text=lbText
-            b.TextColor3=Color3.fromRGB(225,210,255); b.TextSize=18; b.Font=Enum.Font.GothamBold; b.Parent=p
-            corner(b,7); b.MouseButton1Click:Connect(fn)
-        end
-        makeSideBtn(240,"-",function() if MIN_PLAYERS>1 then MIN_PLAYERS-=1; updLbl() end end)
-        makeSideBtn(278,"+",function() if MIN_PLAYERS<4 then MIN_PLAYERS+=1; updLbl() end end)
+        local bMinus=Instance.new("TextButton"); bMinus.Size=UDim2.fromOffset(34,28); bMinus.Position=UDim2.fromOffset(240,y+1)
+        bMinus.BackgroundColor3=PALETTE.accentDim; bMinus.BorderSizePixel=0; bMinus.Text="-"
+        bMinus.TextColor3=Color3.fromRGB(225,210,255); bMinus.TextSize=18; bMinus.Font=Enum.Font.GothamBold; bMinus.Parent=p
+        corner(bMinus,7); bMinus.MouseButton1Click:Connect(function() if MIN_PLAYERS>1 then MIN_PLAYERS-=1; updLbl() end end)
+        local bPlus=Instance.new("TextButton"); bPlus.Size=UDim2.fromOffset(34,28); bPlus.Position=UDim2.fromOffset(278,y+1)
+        bPlus.BackgroundColor3=PALETTE.accentDim; bPlus.BorderSizePixel=0; bPlus.Text="+"
+        bPlus.TextColor3=Color3.fromRGB(225,210,255); bPlus.TextSize=18; bPlus.Font=Enum.Font.GothamBold; bPlus.Parent=p
+        corner(bPlus,7); bPlus.MouseButton1Click:Connect(function() if MIN_PLAYERS<4 then MIN_PLAYERS+=1; updLbl() end end)
         y=y+38
     end
 
     y=y+6; y=sectionHeader(p,y,"AUTO CARD")
     local _,s6=makeToggle(p,y,"Auto Card",function(v) AUTO_CARD=v end)
-    invasionSetters.AUTO_CARD=s6; y=y+44
+    invasionSetters.AUTO_CARD=s6; y=y+44+2
 
-    y=y+2; y=miniLabel(p,y,"Primario:")
+    y=miniLabel(p,y,"Primario:")
     do
         local btnD=Instance.new("TextButton"); btnD.Size=UDim2.new(0.5,-4,0,32); btnD.Position=UDim2.fromOffset(0,y)
         btnD.BackgroundColor3=Color3.fromRGB(95,30,35); btnD.BorderSizePixel=0; btnD.Text="Dano (ativo)"
@@ -1308,16 +1423,16 @@ do
         end
         for i,op in ipairs(OPCOES) do
             local item=Instance.new("TextButton"); item.Size=UDim2.new(1,0,0,ITEM_H); item.Position=UDim2.fromOffset(0,(i-1)*ITEM_H+3)
-            item.BackgroundTransparency=1; item.BorderSizePixel=0; item.Text="  "..op.label; item.TextColor3=Color3.fromRGB(205,198,230)
-            item.TextSize=12; item.Font=Enum.Font.GothamBold; item.TextXAlignment=Enum.TextXAlignment.Left; item.ZIndex=21; item.Parent=popup
+            item.BackgroundTransparency=1; item.BorderSizePixel=0; item.Text="  "..op.label
+            item.TextColor3=Color3.fromRGB(205,198,230); item.TextSize=12; item.Font=Enum.Font.GothamBold
+            item.TextXAlignment=Enum.TextXAlignment.Left; item.ZIndex=21; item.Parent=popup
             item.MouseEnter:Connect(function() item.BackgroundTransparency=0; item.BackgroundColor3=Color3.fromRGB(42,33,78) end)
             item.MouseLeave:Connect(function() item.BackgroundTransparency=1 end)
             item.MouseButton1Click:Connect(function() CARD_SEC_ID=op.id; updSec(); popup.Visible=false end)
         end
         btnSec.MouseButton1Click:Connect(function() popup.Visible=not popup.Visible end)
-        cardSecUpdate=updSec; y=y+8
+        cardSecUpdate=updSec
     end
-    y=y+4
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -1331,8 +1446,6 @@ do
     treasureSetter=set; y=y+44
     y=y+4; y=miniLabel(p,y,"Cava sozinho enquanto tiver pas.",Color3.fromRGB(160,155,185))
     y=y+4; y=miniLabel(p,y,"Notificacao mostra o item obtido a cada cavada.",Color3.fromRGB(100,185,140))
-
-    -- Painel de info ao vivo
     y=y+8; y=sectionHeader(p,y,"INFO AO VIVO")
     y=infoRow(p,y,"Pás restantes", getQuantidadeDePas)
     y=infoRow(p,y,"Tiles ja cavados", function()
@@ -1347,23 +1460,18 @@ end
 -- ════════════════════════════════════════════════════════════
 do
     local p=pageFrames["CAPSULAS"]; local y=4
-
     y=sectionHeader(p,y,"INFORMACOES")
     y=infoRow(p,y,"SummerStar", capsGetCurrency)
     y=infoRow(p,y,"Capsulas no inv.", capsGetOwned)
     y=infoRow(p,y,"Pode comprar", capsGetMaxAffordable)
     y=y+6
-
     y=sectionHeader(p,y,"COMPRAR")
     y=makeButton(p,y,"Comprar todas agora",Color3.fromRGB(35,120,55),function()
         task.spawn(function() capsBuyMaxOnce() end)
     end)
     y=y+4
-
     y=miniLabel(p,y,"Auto Compra — limite de SummerStar:",Color3.fromRGB(160,155,185))
-    local newY,autoBuyBox = makeTextBox(p,y,"Ex: 5000")
-    y=newY
-
+    local newY,autoBuyBox = makeTextBox(p,y,"Ex: 5000"); y=newY
     do
         local b=Instance.new("TextButton"); b.Size=UDim2.new(1,0,0,38); b.Position=UDim2.fromOffset(0,y)
         b.BackgroundColor3=Color3.fromRGB(80,35,35); b.BorderSizePixel=0
@@ -1384,37 +1492,32 @@ do
         y=y+44
     end
     y=y+6
-
     y=sectionHeader(p,y,"ABRIR")
     y=makeButton(p,y,"Abrir todas agora",Color3.fromRGB(35,75,160),function()
         task.spawn(function() capsOpenAll() end)
     end)
     y=y+4
-
     y=miniLabel(p,y,"Auto Abertura — limite de capsulas:",Color3.fromRGB(160,155,185))
-    local newY2,autoOpenBox = makeTextBox(p,y,"Ex: 10")
-    y=newY2
-
+    local newY2,autoOpenBox = makeTextBox(p,y,"Ex: 10"); y=newY2
     do
-        local b=Instance.new("TextButton"); b.Size=UDim2.new(1,0,0,38); b.Position=UDim2.fromOffset(0,y)
-        b.BackgroundColor3=Color3.fromRGB(80,35,35); b.BorderSizePixel=0
-        b.Text="Auto Abertura — OFF"; b.TextColor3=Color3.fromRGB(235,228,255)
-        b.TextSize=13; b.Font=Enum.Font.GothamBold; b.Parent=p; corner(b,9)
-        b.MouseButton1Click:Connect(function()
+        local b2=Instance.new("TextButton"); b2.Size=UDim2.new(1,0,0,38); b2.Position=UDim2.fromOffset(0,y)
+        b2.BackgroundColor3=Color3.fromRGB(80,35,35); b2.BorderSizePixel=0
+        b2.Text="Auto Abertura — OFF"; b2.TextColor3=Color3.fromRGB(235,228,255)
+        b2.TextSize=13; b2.Font=Enum.Font.GothamBold; b2.Parent=p; corner(b2,9)
+        b2.MouseButton1Click:Connect(function()
             if not autoOpenEnabled then
                 local limit=tonumber(autoOpenBox.Text)
                 if limit==nil or limit<=0 then return end
                 autoOpenLimit=math.floor(limit); autoOpenEnabled=true
-                b.Text="Auto Abertura — ON ("..autoOpenLimit..")"; b.BackgroundColor3=Color3.fromRGB(30,100,50)
+                b2.Text="Auto Abertura — ON ("..autoOpenLimit..")"; b2.BackgroundColor3=Color3.fromRGB(30,100,50)
                 capsStartAutoOpenLoop()
             else
                 autoOpenEnabled=false
-                b.Text="Auto Abertura — OFF"; b.BackgroundColor3=Color3.fromRGB(80,35,35)
+                b2.Text="Auto Abertura — OFF"; b2.BackgroundColor3=Color3.fromRGB(80,35,35)
             end
         end)
         y=y+44
     end
-    y=y+4
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -1423,7 +1526,6 @@ end
 local keybindDisplayLabel
 do
     local p=pageFrames["CONFIG"]; local y=4
-
     y=sectionHeader(p,y,"BLACK SCREEN")
     do
         local btnBS=Instance.new("TextButton"); btnBS.Size=UDim2.new(1,0,0,38); btnBS.Position=UDim2.fromOffset(0,y)
@@ -1438,89 +1540,189 @@ do
         btnBS.MouseButton1Click:Connect(function() setBlackScreen(not BLACK_SCREEN) end)
     end
     y=miniLabel(p,y,"Tela preta com chuva. Botao X fecha.",Color3.fromRGB(160,155,185))
-
     y=y+8; y=sectionHeader(p,y,"ANTI-AFK")
     y=miniLabel(p,y,"Sempre ativo.",Color3.fromRGB(160,155,185))
-
     y=y+8; y=sectionHeader(p,y,"NOTIFICACOES")
-    local notifSetters={}
-    local _,ms=makeCompactToggle(p,y,"Ativar notificacoes",function(v) NOTIF_ENABLED=v end,NOTIF_ENABLED)
+    local _,_ms=makeCompactToggle(p,y,"Ativar notificacoes",function(v) NOTIF_ENABLED=v end,NOTIF_ENABLED)
     y=y+34
-    local NOTIF_DEFS={
-        {key="NOTIF_INVASION_DISP", label="Invasion disponivel"},
-        {key="NOTIF_INVASION_START",label="Invasion comecou"},
-        {key="NOTIF_INVASION_END",  label="Invasion terminou"},
-        {key="NOTIF_ENTROU",        label="Entrou em invasion"},
-        {key="NOTIF_TP",            label="Auto TP na torre"},
-        {key="NOTIF_TREASURE",      label="Cavada do tesouro (item)"},
-    }
-    local notifVars={
-        NOTIF_INVASION_DISP =function(v) NOTIF_INVASION_DISP=v end,
-        NOTIF_INVASION_START=function(v) NOTIF_INVASION_START=v end,
-        NOTIF_INVASION_END  =function(v) NOTIF_INVASION_END=v end,
-        NOTIF_ENTROU        =function(v) NOTIF_ENTROU=v end,
-        NOTIF_TP            =function(v) NOTIF_TP=v end,
-        NOTIF_TREASURE      =function(v) NOTIF_TREASURE=v end,
-    }
-    local notifStart={
-        NOTIF_INVASION_DISP=NOTIF_INVASION_DISP, NOTIF_INVASION_START=NOTIF_INVASION_START,
-        NOTIF_INVASION_END=NOTIF_INVASION_END, NOTIF_ENTROU=NOTIF_ENTROU,
-        NOTIF_TP=NOTIF_TP, NOTIF_TREASURE=NOTIF_TREASURE,
-    }
-    for _,def in ipairs(NOTIF_DEFS) do
-        local newY,setter=makeCompactToggle(p,y,def.label,function(v) if notifVars[def.key] then notifVars[def.key](v) end end,notifStart[def.key])
-        notifSetters[def.key]=setter; y=newY
+    do
+        local NOTIF_DEFS={
+            {key="NOTIF_INVASION_DISP", label="Invasion disponivel"},
+            {key="NOTIF_INVASION_START",label="Invasion comecou"},
+            {key="NOTIF_INVASION_END",  label="Invasion terminou"},
+            {key="NOTIF_ENTROU",        label="Entrou em invasion"},
+            {key="NOTIF_TP",            label="Auto TP na torre"},
+            {key="NOTIF_TREASURE",      label="Cavada do tesouro (item)"},
+        }
+        local notifVars={
+            NOTIF_INVASION_DISP =function(v) NOTIF_INVASION_DISP=v end,
+            NOTIF_INVASION_START=function(v) NOTIF_INVASION_START=v end,
+            NOTIF_INVASION_END  =function(v) NOTIF_INVASION_END=v end,
+            NOTIF_ENTROU        =function(v) NOTIF_ENTROU=v end,
+            NOTIF_TP            =function(v) NOTIF_TP=v end,
+            NOTIF_TREASURE      =function(v) NOTIF_TREASURE=v end,
+        }
+        local notifStart={
+            NOTIF_INVASION_DISP=NOTIF_INVASION_DISP, NOTIF_INVASION_START=NOTIF_INVASION_START,
+            NOTIF_INVASION_END=NOTIF_INVASION_END, NOTIF_ENTROU=NOTIF_ENTROU,
+            NOTIF_TP=NOTIF_TP, NOTIF_TREASURE=NOTIF_TREASURE,
+        }
+        for _,def in ipairs(NOTIF_DEFS) do
+            local newY2,_=makeCompactToggle(p,y,def.label,function(v) if notifVars[def.key] then notifVars[def.key](v) end end,notifStart[def.key])
+            y=newY2
+        end
     end
-
     y=y+8; y=sectionHeader(p,y,"KEYBIND")
     keybindDisplayLabel=Instance.new("TextLabel"); keybindDisplayLabel.Size=UDim2.new(1,0,0,24); keybindDisplayLabel.Position=UDim2.fromOffset(0,y)
     keybindDisplayLabel.BackgroundTransparency=1; keybindDisplayLabel.Text="Atual: RightShift + K"
     keybindDisplayLabel.TextColor3=PALETTE.textMain; keybindDisplayLabel.TextSize=13; keybindDisplayLabel.Font=Enum.Font.GothamBold
     keybindDisplayLabel.TextXAlignment=Enum.TextXAlignment.Left; keybindDisplayLabel.Parent=p; y=y+28
-    local btnRecord=Instance.new("TextButton"); btnRecord.Size=UDim2.new(1,0,0,38); btnRecord.Position=UDim2.fromOffset(0,y)
-    btnRecord.BackgroundColor3=PALETTE.accentDim; btnRecord.BorderSizePixel=0; btnRecord.Text="Gravar nova keybind"
-    btnRecord.TextColor3=Color3.fromRGB(235,228,255); btnRecord.TextSize=13; btnRecord.Font=Enum.Font.GothamBold; btnRecord.Parent=p; corner(btnRecord,9)
-    y=y+44; y=miniLabel(p,y,"Clique, aperte as teclas, clique em Parar.",Color3.fromRGB(160,155,185))
-    local recordedKeys={}; local recordConn=nil
-    local function keybindParaTexto(keys)
-        if keys==nil or #keys==0 then return "Nenhuma" end; return table.concat(keys," + ")
+    do
+        local btnRecord=Instance.new("TextButton"); btnRecord.Size=UDim2.new(1,0,0,38); btnRecord.Position=UDim2.fromOffset(0,y)
+        btnRecord.BackgroundColor3=PALETTE.accentDim; btnRecord.BorderSizePixel=0; btnRecord.Text="Gravar nova keybind"
+        btnRecord.TextColor3=Color3.fromRGB(235,228,255); btnRecord.TextSize=13; btnRecord.Font=Enum.Font.GothamBold; btnRecord.Parent=p; corner(btnRecord,9)
+        y=y+44; y=miniLabel(p,y,"Clique, aperte as teclas, clique em Parar.",Color3.fromRGB(160,155,185))
+        local recordedKeys={}; local recordConn=nil
+        local function keybindParaTexto(keys)
+            if keys==nil or #keys==0 then return "Nenhuma" end; return table.concat(keys," + ")
+        end
+        local function pararGravacao()
+            KEYBIND_RECORDING=false; if recordConn then recordConn:Disconnect(); recordConn=nil end
+            btnRecord.Text="Gravar nova keybind"; btnRecord.BackgroundColor3=PALETTE.accentDim
+            if #recordedKeys>0 then KEYBIND_KEYS=recordedKeys; keybindDisplayLabel.Text="Atual: "..keybindParaTexto(KEYBIND_KEYS) end
+        end
+        local function iniciarGravacao()
+            KEYBIND_RECORDING=true; recordedKeys={}; btnRecord.Text="Parar (gravando)"; btnRecord.BackgroundColor3=PALETTE.danger
+            keybindDisplayLabel.Text="Atual: (gravando...)"
+            recordConn=UserInputService.InputBegan:Connect(function(input,gpe)
+                if gpe then return end
+                if input.UserInputType==Enum.UserInputType.Keyboard then
+                    local kn=input.KeyCode.Name; local jaTem=false
+                    for _,k in ipairs(recordedKeys) do if k==kn then jaTem=true end end
+                    if not jaTem then table.insert(recordedKeys,kn); keybindDisplayLabel.Text="Atual: "..keybindParaTexto(recordedKeys).." ..." end
+                end
+            end)
+        end
+        btnRecord.MouseButton1Click:Connect(function() if KEYBIND_RECORDING then pararGravacao() else iniciarGravacao() end end)
     end
-    local function pararGravacao()
-        KEYBIND_RECORDING=false; if recordConn then recordConn:Disconnect(); recordConn=nil end
-        btnRecord.Text="Gravar nova keybind"; btnRecord.BackgroundColor3=PALETTE.accentDim
-        if #recordedKeys>0 then KEYBIND_KEYS=recordedKeys; keybindDisplayLabel.Text="Atual: "..keybindParaTexto(KEYBIND_KEYS) end
-    end
-    local function iniciarGravacao()
-        KEYBIND_RECORDING=true; recordedKeys={}; btnRecord.Text="Parar (gravando)"; btnRecord.BackgroundColor3=PALETTE.danger
-        keybindDisplayLabel.Text="Atual: (gravando...)"
-        recordConn=UserInputService.InputBegan:Connect(function(input,gpe)
-            if gpe then return end
-            if input.UserInputType==Enum.UserInputType.Keyboard then
-                local kn=input.KeyCode.Name; local jaTem=false
-                for _,k in ipairs(recordedKeys) do if k==kn then jaTem=true end end
-                if not jaTem then table.insert(recordedKeys,kn); keybindDisplayLabel.Text="Atual: "..keybindParaTexto(recordedKeys).." ..." end
-            end
-        end)
-    end
-    btnRecord.MouseButton1Click:Connect(function() if KEYBIND_RECORDING then pararGravacao() else iniciarGravacao() end end)
-
     y=y+6; y=sectionHeader(p,y,"CONFIGURACAO")
-    local statusLbl=Instance.new("TextLabel"); statusLbl.Size=UDim2.new(1,0,0,18); statusLbl.Position=UDim2.fromOffset(0,y)
-    statusLbl.BackgroundTransparency=1; statusLbl.Text=""; statusLbl.TextColor3=Color3.fromRGB(150,225,160)
-    statusLbl.TextSize=11; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.Parent=p; y=y+22
-    local function mostrarStatus(msg,ok)
-        statusLbl.Text=msg; statusLbl.TextColor3=ok and Color3.fromRGB(150,225,160) or Color3.fromRGB(235,130,130)
-        task.delay(3,function() if statusLbl.Text==msg then statusLbl.Text="" end end)
+    do
+        local statusLbl=Instance.new("TextLabel"); statusLbl.Size=UDim2.new(1,0,0,18); statusLbl.Position=UDim2.fromOffset(0,y)
+        statusLbl.BackgroundTransparency=1; statusLbl.Text=""; statusLbl.TextColor3=Color3.fromRGB(150,225,160)
+        statusLbl.TextSize=11; statusLbl.Font=Enum.Font.Gotham; statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.Parent=p; y=y+22
+        local function mostrarStatus(msg,ok2)
+            statusLbl.Text=msg; statusLbl.TextColor3=ok2 and Color3.fromRGB(150,225,160) or Color3.fromRGB(235,130,130)
+            task.delay(3,function() if statusLbl.Text==msg then statusLbl.Text="" end end)
+        end
+        y=makeButton(p,y,"Salvar configuracao",Color3.fromRGB(28,95,80),function()
+            local ok2=salvarConfig(); mostrarStatus(ok2 and "Salvo." or "Falha ao salvar.",ok2)
+        end)
+        y=makeButton(p,y,"Carregar configuracao",PALETTE.accentDim,function()
+            local dados=carregarConfigDoArquivo()
+            if dados==nil then mostrarStatus("Nenhuma config encontrada.",false); return end
+            _G.__lz3s_aplicarConfig(dados); mostrarStatus("Configuracao carregada.",true)
+        end)
+        y=miniLabel(p,y,"Salva toggles, cartas, keybind, notifs e webhook.",Color3.fromRGB(160,155,185))
     end
-    y=makeButton(p,y,"Salvar configuracao",Color3.fromRGB(28,95,80),function()
-        local ok=salvarConfig(); mostrarStatus(ok and "Salvo." or "Falha ao salvar.",ok)
+end
+
+-- ════════════════════════════════════════════════════════════
+--  PÁGINA: WEBHOOK
+-- ════════════════════════════════════════════════════════════
+local whUrlBox
+do
+    local p=pageFrames["WEBHOOK"]; local y=4
+
+    -- Header com indicador de status
+    local headerLbl=Instance.new("TextLabel"); headerLbl.Size=UDim2.new(1,0,0,20); headerLbl.Position=UDim2.fromOffset(0,y)
+    headerLbl.BackgroundTransparency=1; headerLbl.Text="WEBHOOK — DISCORD"
+    headerLbl.TextColor3=Color3.fromRGB(80,190,200); headerLbl.TextSize=13; headerLbl.Font=Enum.Font.GothamBold
+    headerLbl.TextXAlignment=Enum.TextXAlignment.Left; headerLbl.Parent=p
+    divider(p,y+22); y=y+32
+
+    -- Status dot (verde = configurado, vermelho = vazio)
+    local statusDot=Instance.new("Frame"); statusDot.Size=UDim2.fromOffset(10,10); statusDot.Position=UDim2.new(1,-12,0,y-26)
+    statusDot.BackgroundColor3=Color3.fromRGB(200,60,60); statusDot.BorderSizePixel=0; statusDot.Parent=p
+    corner(statusDot,5)
+
+    y=miniLabel(p,y,"URL do Webhook (Discord):",Color3.fromRGB(160,155,185))
+    local newY,box=makeTextBox(p,y,"https://discord.com/api/webhooks/..."); y=newY
+    whUrlBox=box
+
+    -- Botão Salvar URL
+    local btnSalvarUrl=Instance.new("TextButton"); btnSalvarUrl.Size=UDim2.new(1,0,0,36); btnSalvarUrl.Position=UDim2.fromOffset(0,y)
+    btnSalvarUrl.BackgroundColor3=Color3.fromRGB(28,90,75); btnSalvarUrl.BorderSizePixel=0
+    btnSalvarUrl.Text="💾  Salvar URL"; btnSalvarUrl.TextColor3=Color3.fromRGB(170,255,210)
+    btnSalvarUrl.TextSize=13; btnSalvarUrl.Font=Enum.Font.GothamBold; btnSalvarUrl.Parent=p; corner(btnSalvarUrl,9)
+    y=y+42
+
+    local whStatusLbl=Instance.new("TextLabel"); whStatusLbl.Size=UDim2.new(1,0,0,16); whStatusLbl.Position=UDim2.fromOffset(0,y)
+    whStatusLbl.BackgroundTransparency=1; whStatusLbl.Text=""
+    whStatusLbl.TextColor3=Color3.fromRGB(150,225,160); whStatusLbl.TextSize=11; whStatusLbl.Font=Enum.Font.Gotham
+    whStatusLbl.TextXAlignment=Enum.TextXAlignment.Left; whStatusLbl.Parent=p; y=y+20
+
+    local function atualizarDotUrl()
+        if WEBHOOK_URL ~= "" then
+            statusDot.BackgroundColor3=Color3.fromRGB(80,220,130)
+        else
+            statusDot.BackgroundColor3=Color3.fromRGB(200,60,60)
+        end
+    end
+
+    local function mostrarWhStatus(msg,ok2)
+        whStatusLbl.Text=msg; whStatusLbl.TextColor3=ok2 and Color3.fromRGB(150,225,160) or Color3.fromRGB(235,130,130)
+        task.delay(3,function() if whStatusLbl.Text==msg then whStatusLbl.Text="" end end)
+    end
+
+    btnSalvarUrl.MouseButton1Click:Connect(function()
+        local url = box.Text:gsub("%s","")
+        if url=="" then mostrarWhStatus("URL vazia.",false); return end
+        if not url:match("^https://discord%.com/api/webhooks/") then
+            mostrarWhStatus("URL invalida. Use Discord webhook.",false); return
+        end
+        WEBHOOK_URL=url; atualizarDotUrl(); salvarConfig()
+        mostrarWhStatus("URL salva com sucesso!",true)
     end)
-    y=makeButton(p,y,"Carregar configuracao",PALETTE.accentDim,function()
-        local dados=carregarConfigDoArquivo()
-        if dados==nil then mostrarStatus("Nenhuma config encontrada.",false); return end
-        _G.__lz3s_aplicarConfig(dados); mostrarStatus("Configuracao carregada.",true)
+
+    y=y+4; divider(p,y); y=y+14
+
+    -- Toggles de eventos
+    local lbl2=Instance.new("TextLabel"); lbl2.Size=UDim2.new(1,0,0,16); lbl2.Position=UDim2.fromOffset(0,y)
+    lbl2.BackgroundTransparency=1; lbl2.Text="EVENTOS ATIVOS"
+    lbl2.TextColor3=PALETTE.accent; lbl2.TextSize=13; lbl2.Font=Enum.Font.GothamBold
+    lbl2.TextXAlignment=Enum.TextXAlignment.Left; lbl2.Parent=p; y=y+20
+
+    local newY2,_=makeCompactToggle(p,y,"Drops de Cápsulas",function(v) WH_CAPSULE_ENABLED=v end,WH_CAPSULE_ENABLED)
+    y=newY2
+    y=miniLabel(p,y,"Envia itens obtidos ao abrir cápsulas + total no inv.",Color3.fromRGB(100,185,200))
+
+    local newY3,_=makeCompactToggle(p,y,"Relatório de Invasion",function(v) WH_INVASION_ENABLED=v end,WH_INVASION_ENABLED)
+    y=newY3
+    y=miniLabel(p,y,"Envia ao fim: drops, duração, cartas, pás, jogadores.",Color3.fromRGB(100,185,200))
+
+    y=y+6; divider(p,y); y=y+14
+
+    -- Botão de teste
+    y=makeButton(p,y,"🧪  Enviar mensagem de teste",Color3.fromRGB(55,40,110),function()
+        if WEBHOOK_URL=="" then mostrarWhStatus("Configure a URL primeiro!",false); return end
+        wh_send({ embeds={{
+            title       = "✅ lz3s Webhook — Teste",
+            description = "Webhook configurado e funcionando!\n\n"
+                       .. "**Módulos ativos:**\n"
+                       .. (WH_CAPSULE_ENABLED and "✅" or "❌") .. " Drops de Cápsulas\n"
+                       .. (WH_INVASION_ENABLED and "✅" or "❌") .. " Relatório de Invasion",
+            color       = 0x7A50EB,
+            footer      = wh_footer(),
+        }}})
+        mostrarWhStatus("Teste enviado! Verifique o Discord.",true)
     end)
-    y=miniLabel(p,y,"Salva toggles, cartas, keybind e notifs.",Color3.fromRGB(160,155,185))
+
+    y=y+4
+    y=miniLabel(p,y,"Mensagens usam embeds dark com campos inline.",Color3.fromRGB(100,95,130))
+    y=miniLabel(p,y,"A URL fica salva no arquivo de config local.",Color3.fromRGB(100,95,130))
+
+    -- Inicializa dot ao carregar
+    atualizarDotUrl()
 end
 
 -- ============================================================
@@ -1535,6 +1737,14 @@ _G.__lz3s_aplicarConfig = function(dados)
         KEYBIND_KEYS=dados.KEYBIND_KEYS
         if keybindDisplayLabel then keybindDisplayLabel.Text="Atual: "..table.concat(KEYBIND_KEYS," + ") end
     end
+    -- Webhook
+    if dados.WEBHOOK_URL and dados.WEBHOOK_URL~="" then
+        WEBHOOK_URL=dados.WEBHOOK_URL
+        if whUrlBox then whUrlBox.Text=WEBHOOK_URL end
+    end
+    if dados.WH_CAPSULE_ENABLED~=nil  then WH_CAPSULE_ENABLED=dados.WH_CAPSULE_ENABLED   end
+    if dados.WH_INVASION_ENABLED~=nil then WH_INVASION_ENABLED=dados.WH_INVASION_ENABLED  end
+    -- Toggles invasion
     local function applyToggle(setter,val) if setter then setter(val==true,true) end end
     applyToggle(invasionSetters.AUTO_START,  dados.AUTO_START)
     applyToggle(invasionSetters.AUTO_ACCEPT, dados.AUTO_ACCEPT)
@@ -1574,7 +1784,7 @@ do
         pressionadas[input.KeyCode.Name]=true
         if sequenciaCompleta() then ScreenGui.Enabled=not ScreenGui.Enabled end
     end)
-    UserInputService.InputEnded:Connect(function(input,gpe)
+    UserInputService.InputEnded:Connect(function(input,_gpe)
         if input.UserInputType~=Enum.UserInputType.Keyboard then return end
         pressionadas[input.KeyCode.Name]=nil
     end)
@@ -1604,4 +1814,4 @@ task.defer(function()
     if dados~=nil then _G.__lz3s_aplicarConfig(dados); logf("Config carregada automaticamente.") end
 end)
 
-print("[lz3s Invasion v2] Carregado! Keybind: RightShift + K | Abas: Invasion / Treasure / Capsulas / Config")
+print("[lz3s Invasion v2] Carregado! Keybind: RightShift + K | Abas: Invasion / Treasure / Capsulas / Config / Webhook")

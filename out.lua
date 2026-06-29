@@ -46,8 +46,14 @@ end)
 local clearInvasionJoinPrompt = ok_jp and joinPromptStore.clearInvasionJoinPrompt or nil
 
 -- ===================== MÓDULOS (TREASURE) =====================
-local getPlayerData = require(nav(ReplicatedStorage, "src", "common", "store", "players", "datastore")).getPlayerData
+local getPlayerData            = require(nav(ReplicatedStorage, "src", "common", "store", "players", "datastore")).getPlayerData
 local TREASURE_HUNT_TILE_COUNT = require(nav(ReplicatedStorage, "src", "common", "content", "events", "treasure-hunt")).TREASURE_HUNT_TILE_COUNT
+
+-- ===================== MÓDULOS (ITENS - para nome do item) =====================
+local ok_items, itemsContent = pcall(function()
+    return require(nav(ReplicatedStorage, "src", "common", "content", "items", "items")).itemsContent
+end)
+if not ok_items then itemsContent = {} end
 
 -- ===================== MÓDULOS (CÁPSULAS) =====================
 local shopsContent = require(nav(ReplicatedStorage, "src", "common", "content", "purchases", "shops")).shopsContent
@@ -332,15 +338,17 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
---  AUTO TP
+--  AUTO TP  (versão corrigida com ChildAdded)
 -- ============================================================
 local tpFeitoIds = {}
 
 local function buscarPosTurret(invasionFolder)
+    -- Tenta achar imediatamente
     local turret = invasionFolder:FindFirstChild("Main Base Turret")
     if turret == nil then
+        -- Aguarda até 15s pelo turret aparecer
         local ok, result = pcall(function()
-            return invasionFolder:WaitForChild("Main Base Turret", 10)
+            return invasionFolder:WaitForChild("Main Base Turret", 15)
         end)
         if ok and result then turret = result end
     end
@@ -364,41 +372,71 @@ local function buscarPosTurret(invasionFolder)
     end
 end
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if not AUTO_TP then continue end
-        local char = Players.LocalPlayer.Character
-        if char == nil then continue end
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp == nil then continue end
-        local mapFolder
-        pcall(function()
-            local world = workspace:FindFirstChild("World")
-            if world then mapFolder = world:FindFirstChild("Map") end
-        end)
-        if mapFolder == nil then continue end
-        for _, filho in ipairs(mapFolder:GetChildren()) do
-            local nome = filho.Name
-            if not nome:match("^invasion%-.") then continue end
-            if tpFeitoIds[nome] then continue end
-            task.spawn(function()
-                logf("Auto TP: encontrei " .. nome)
-                local pos, err = buscarPosTurret(filho)
-                if pos == nil then logf("Auto TP ERRO: " .. tostring(err)); return end
-                if not AUTO_TP then return end
-                local c2 = Players.LocalPlayer.Character
-                if c2 == nil then return end
-                local hrp2 = c2:FindFirstChild("HumanoidRootPart")
-                if hrp2 == nil then return end
-                tpFeitoIds[nome] = true
-                hrp2.CFrame = CFrame.new(pos + Vector3.new(0, 10, 0))
-                logf("Auto TP: teleportado para " .. nome)
-                if NOTIF_TP then criarNotif("tp", "Auto TP", "Teleportado para a torre!", 4) end
-            end)
-            break
+local function tentarTpParaInvasion(filho)
+    local nome = filho.Name
+    if not nome:match("^invasion%-.") then return end
+    if tpFeitoIds[nome] then return end
+    if not AUTO_TP then return end
+
+    task.spawn(function()
+        logf("Auto TP: detectei " .. nome .. ", aguardando Main Base Turret...")
+        local pos, err = buscarPosTurret(filho)
+        if pos == nil then
+            logf("Auto TP ERRO: " .. tostring(err))
+            return
         end
+        if not AUTO_TP then return end
+
+        -- Aguarda personagem se necessário
+        local char = Players.LocalPlayer.Character
+        if char == nil then
+            for _ = 1, 80 do
+                task.wait(0.1)
+                char = Players.LocalPlayer.Character
+                if char then break end
+            end
+        end
+        if char == nil then return end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp == nil then return end
+
+        tpFeitoIds[nome] = true
+        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 10, 0))
+        logf("Auto TP: teleportado para " .. nome)
+        if NOTIF_TP then criarNotif("tp", "Auto TP", "Teleportado para a torre!", 4) end
+    end)
+end
+
+-- Aguarda o Map e monitora via ChildAdded
+task.spawn(function()
+    local mapFolder
+    local ok = pcall(function()
+        local world = workspace:WaitForChild("World", 30)
+        mapFolder = world:WaitForChild("Map", 30)
+    end)
+    if not ok or mapFolder == nil then
+        warn("[lz3s] Auto TP: workspace.World.Map nao encontrado")
+        return
     end
+
+    -- Tenta TP para invasions que já existiam ao carregar
+    for _, filho in ipairs(mapFolder:GetChildren()) do
+        tentarTpParaInvasion(filho)
+    end
+
+    -- Detecta novas invasions em tempo real (sem polling)
+    mapFolder.ChildAdded:Connect(function(filho)
+        tentarTpParaInvasion(filho)
+    end)
+
+    -- Limpa IDs quando a invasion é removida, permitindo TP em nova invasion
+    mapFolder.ChildRemoved:Connect(function(filho)
+        if tpFeitoIds[filho.Name] then
+            tpFeitoIds[filho.Name] = nil
+            logf("Auto TP: invasion removida, ID limpo: " .. filho.Name)
+        end
+    end)
 end)
 
 -- ============================================================
@@ -435,6 +473,25 @@ local function escolherTileAleatoria()
     return disp[math.random(1, #disp)]
 end
 
+-- Retorna o nome de display do item, ou o id se não encontrado
+local function getNomeItem(itemId)
+    if itemId == nil then return "?" end
+    local content = itemsContent[itemId]
+    if content and content.displayName then return content.displayName end
+    return tostring(itemId)
+end
+
+-- Formata a recompensa de forma legível
+local function formatarRecompensa(reward)
+    if reward == nil then return "Item desconhecido" end
+    local nome = getNomeItem(reward.id or reward)
+    local amount = reward.amount
+    if amount and amount > 1 then
+        return nome .. " x" .. tostring(amount)
+    end
+    return nome
+end
+
 local function cavarUmaVez()
     local tile = escolherTileAleatoria()
     if tile == nil then return end
@@ -446,9 +503,25 @@ local function cavarUmaVez()
         else
             if NOTIF_TREASURE then
                 local pasRestantes = getQuantidadeDePas()
-                local recompensa = ""
-                if r and r.reward then recompensa = " - " .. tostring(r.reward.id or r.reward) end
-                criarNotif("treasure", "Tesouro Cavado", "Pas: " .. pasRestantes .. recompensa, 4)
+                -- Monta lista de itens revelados
+                local recompensas = {}
+                if r and r.revealed then
+                    for _, rev in ipairs(r.revealed) do
+                        if rev and rev.reward then
+                            table.insert(recompensas, formatarRecompensa(rev.reward))
+                        end
+                    end
+                elseif r and r.reward then
+                    table.insert(recompensas, formatarRecompensa(r.reward))
+                end
+
+                local recompensaTexto = #recompensas > 0
+                    and table.concat(recompensas, ", ")
+                    or "Recompensa obtida"
+
+                -- Linha 1: recompensa | Linha 2: pas restantes
+                local msg = recompensaTexto .. "\nPas restantes: " .. pasRestantes
+                criarNotifTreasure("Tesouro Cavado", recompensaTexto, pasRestantes)
             end
         end
     end):catch(function(err) logf("Auto Treasure promise: " .. tostring(err)) end)
@@ -465,7 +538,11 @@ local function iniciarLoopTreasure()
                 cavarUmaVez()
                 task.wait(DELAY_ENTRE_CAVADAS)
             else
-                if not avisouSemPas then avisouSemPas = true; logf("Auto Treasure: sem pas") end
+                if not avisouSemPas then
+                    avisouSemPas = true
+                    logf("Auto Treasure: sem pas")
+                    criarNotif("treasure", "Sem Pas!", "Compre mais pas para continuar cavando.", 5)
+                end
                 task.wait(CHECK_INTERVAL_SEM_PA)
             end
         end
@@ -503,7 +580,6 @@ local function capsTeleportAndBuy(amount)
 
     local originalCFrame = rootPart.CFrame
 
-    -- teleporta para perto do NPC se disponível
     if capsNpcPath then
         local ok, npcCF = pcall(function() return capsNpcPath:GetPivot() end)
         if ok then
@@ -694,7 +770,110 @@ function criarNotif(tipo, titulo, msg, duracao)
     end)
 end
 
--- Watchers de notificação
+-- ============================================================
+--  NOTIFICAÇÃO ESPECIAL DE TREASURE (maior, com item em destaque)
+-- ============================================================
+-- Altura maior para caber mais info
+local TNOTIF_W = 290
+local TNOTIF_H = 78
+
+function criarNotifTreasure(titulo, itemTexto, pasRestantes)
+    if not NOTIF_ENABLED or not NOTIF_TREASURE then return end
+    local duracao = 3.5
+
+    -- Empurra notifs existentes para cima
+    for _, slot in ipairs(notifGui:GetChildren()) do
+        if slot:IsA("Frame") then
+            TweenService:Create(slot, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {
+                Position = UDim2.new(1, slot.Position.X.Offset, 1, slot.Position.Y.Offset - (TNOTIF_H + NOTIF_GAP))
+            }):Play()
+        end
+    end
+
+    local BAR_COLOR  = Color3.fromRGB(220, 170, 40)   -- dourado
+    local ITEM_COLOR = Color3.fromRGB(255, 220, 80)    -- amarelo claro para o item
+    local PAS_COLOR  = Color3.fromRGB(140, 215, 140)   -- verde suave para as pas
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(TNOTIF_W, TNOTIF_H)
+    frame.Position = UDim2.new(1, TNOTIF_W + 20, 1, -(NOTIF_PAD_B + TNOTIF_H))
+    frame.BackgroundColor3 = Color3.fromRGB(20, 18, 10)
+    frame.BorderSizePixel = 0
+    frame.Parent = notifGui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+    local fs = Instance.new("UIStroke", frame)
+    fs.Color = Color3.fromRGB(100, 75, 20); fs.Thickness = 1
+
+    -- Barra lateral dourada
+    local bar = Instance.new("Frame", frame)
+    bar.Size = UDim2.new(0, 4, 1, -16); bar.Position = UDim2.fromOffset(0, 8)
+    bar.BackgroundColor3 = BAR_COLOR; bar.BorderSizePixel = 0
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 4)
+
+    -- Ícone (pá) - círculo dourado
+    local dot = Instance.new("Frame", frame)
+    dot.Size = UDim2.fromOffset(10, 10); dot.Position = UDim2.fromOffset(18, 12)
+    dot.BackgroundColor3 = BAR_COLOR; dot.BorderSizePixel = 0
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    -- Título "Tesouro Cavado"
+    local tLbl = Instance.new("TextLabel", frame)
+    tLbl.Size = UDim2.new(1, -44, 0, 16); tLbl.Position = UDim2.fromOffset(38, 8)
+    tLbl.BackgroundTransparency = 1; tLbl.Text = titulo
+    tLbl.TextColor3 = Color3.fromRGB(240, 220, 160)
+    tLbl.TextSize = 12; tLbl.Font = Enum.Font.GothamBold
+    tLbl.TextXAlignment = Enum.TextXAlignment.Left
+    tLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    -- Item obtido (destaque em dourado/amarelo)
+    local itemLbl = Instance.new("TextLabel", frame)
+    itemLbl.Size = UDim2.new(1, -44, 0, 20); itemLbl.Position = UDim2.fromOffset(38, 26)
+    itemLbl.BackgroundTransparency = 1
+    -- Trunca para não explodir o card se o nome for longo
+    local itemTextoCurto = #itemTexto > 30 and itemTexto:sub(1, 28) .. "…" or itemTexto
+    itemLbl.Text = "⬥ " .. itemTextoCurto
+    itemLbl.TextColor3 = ITEM_COLOR
+    itemLbl.TextSize = 13; itemLbl.Font = Enum.Font.GothamBold
+    itemLbl.TextXAlignment = Enum.TextXAlignment.Left
+    itemLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+    -- Pas restantes
+    local pasLbl = Instance.new("TextLabel", frame)
+    pasLbl.Size = UDim2.new(1, -44, 0, 14); pasLbl.Position = UDim2.fromOffset(38, 50)
+    pasLbl.BackgroundTransparency = 1
+    pasLbl.Text = "Pás restantes: " .. tostring(pasRestantes)
+    pasLbl.TextColor3 = PAS_COLOR
+    pasLbl.TextSize = 11; pasLbl.Font = Enum.Font.Gotham
+    pasLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- Barra de progresso
+    local pBg = Instance.new("Frame", frame)
+    pBg.Size = UDim2.new(1, -16, 0, 2); pBg.Position = UDim2.new(0, 8, 1, -5)
+    pBg.BackgroundColor3 = Color3.fromRGB(50, 40, 10); pBg.BorderSizePixel = 0
+    Instance.new("UICorner", pBg).CornerRadius = UDim.new(1, 0)
+    local prog = Instance.new("Frame", pBg)
+    prog.Size = UDim2.fromScale(1, 1); prog.BackgroundColor3 = BAR_COLOR; prog.BorderSizePixel = 0
+    Instance.new("UICorner", prog).CornerRadius = UDim.new(1, 0)
+
+    -- Slide in
+    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+        Position = UDim2.new(1, -(TNOTIF_W + NOTIF_PAD_R), 1, -(NOTIF_PAD_B + TNOTIF_H))
+    }):Play()
+    TweenService:Create(prog, TweenInfo.new(duracao, Enum.EasingStyle.Linear), {
+        Size = UDim2.fromScale(0, 1)
+    }):Play()
+
+    -- Slide out
+    task.delay(duracao, function()
+        TweenService:Create(frame, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
+            Position = UDim2.new(1, TNOTIF_W + 20, 1, -(NOTIF_PAD_B + TNOTIF_H))
+        }):Play()
+        task.wait(0.3)
+        frame:Destroy()
+    end)
+end
+
+-- Watchers de notificação de lobby
 local jaNotifoiLobby = {}
 task.spawn(function()
     while true do
@@ -888,7 +1067,7 @@ MinimizeBtn.Position=UDim2.new(1,-34,0.5,-14); MinimizeBtn.BackgroundColor3=Colo
 MinimizeBtn.BorderSizePixel=0; MinimizeBtn.Text="-"; MinimizeBtn.TextColor3=PALETTE.textMain
 MinimizeBtn.Font=Enum.Font.GothamBold; MinimizeBtn.TextSize=16; MinimizeBtn.Parent=TitleBar; corner(MinimizeBtn,7)
 
--- Abas (4 agora)
+-- Abas
 local TabBar=Instance.new("Frame"); TabBar.Size=UDim2.new(1,-24,0,36); TabBar.Position=UDim2.fromOffset(12,54)
 TabBar.BackgroundColor3=PALETTE.panel; TabBar.BorderSizePixel=0; TabBar.Parent=Frame; corner(TabBar,10)
 local tp=Instance.new("UIPadding"); tp.PaddingLeft=UDim.new(0,4); tp.PaddingRight=UDim.new(0,4)
@@ -1036,7 +1215,6 @@ local function infoRow(parent,posY,label,valueFunc)
     local vLbl=Instance.new("TextLabel"); vLbl.Size=UDim2.new(0.45,-8,1,0); vLbl.BackgroundTransparency=1
     vLbl.Text=tostring(valueFunc()); vLbl.TextColor3=PALETTE.textMain; vLbl.TextSize=11; vLbl.Font=Enum.Font.GothamBold
     vLbl.TextXAlignment=Enum.TextXAlignment.Right; vLbl.Position=UDim2.new(0.55,0,0,0); vLbl.Parent=row
-    -- atualiza a cada 3s
     task.spawn(function()
         while row.Parent do vLbl.Text=tostring(valueFunc()); task.wait(3) end
     end)
@@ -1152,6 +1330,16 @@ do
     local _,set=makeToggle(p,y,"Auto Treasure",function(v) AUTO_TREASURE=v; if v then iniciarLoopTreasure() end end)
     treasureSetter=set; y=y+44
     y=y+4; y=miniLabel(p,y,"Cava sozinho enquanto tiver pas.",Color3.fromRGB(160,155,185))
+    y=y+4; y=miniLabel(p,y,"Notificacao mostra o item obtido a cada cavada.",Color3.fromRGB(100,185,140))
+
+    -- Painel de info ao vivo
+    y=y+8; y=sectionHeader(p,y,"INFO AO VIVO")
+    y=infoRow(p,y,"Pás restantes", getQuantidadeDePas)
+    y=infoRow(p,y,"Tiles ja cavados", function()
+        local t=getTilesJaCavadas(); local c=0
+        for _ in pairs(t) do c=c+1 end
+        return c.."/"..TREASURE_HUNT_TILE_COUNT
+    end)
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -1160,21 +1348,18 @@ end
 do
     local p=pageFrames["CAPSULAS"]; local y=4
 
-    -- Painel de info (atualiza a cada 3s)
     y=sectionHeader(p,y,"INFORMACOES")
     y=infoRow(p,y,"SummerStar", capsGetCurrency)
     y=infoRow(p,y,"Capsulas no inv.", capsGetOwned)
     y=infoRow(p,y,"Pode comprar", capsGetMaxAffordable)
     y=y+6
 
-    -- COMPRAR
     y=sectionHeader(p,y,"COMPRAR")
     y=makeButton(p,y,"Comprar todas agora",Color3.fromRGB(35,120,55),function()
         task.spawn(function() capsBuyMaxOnce() end)
     end)
     y=y+4
 
-    -- Compra automática
     y=miniLabel(p,y,"Auto Compra — limite de SummerStar:",Color3.fromRGB(160,155,185))
     local newY,autoBuyBox = makeTextBox(p,y,"Ex: 5000")
     y=newY
@@ -1200,43 +1385,35 @@ do
     end
     y=y+6
 
-    -- ABRIR
     y=sectionHeader(p,y,"ABRIR")
     y=makeButton(p,y,"Abrir todas agora",Color3.fromRGB(35,75,160),function()
         task.spawn(function() capsOpenAll() end)
     end)
     y=y+4
 
-    -- Abertura automática
     y=miniLabel(p,y,"Auto Abertura — limite de capsulas:",Color3.fromRGB(160,155,185))
     local newY2,autoOpenBox = makeTextBox(p,y,"Ex: 10")
     y=newY2
 
     do
-        local openBtnRef
-        local function buildOpenBtn()
-            local b=Instance.new("TextButton"); b.Size=UDim2.new(1,0,0,38); b.Position=UDim2.fromOffset(0,y)
-            b.BackgroundColor3=Color3.fromRGB(80,35,35); b.BorderSizePixel=0
-            b.Text="Auto Abertura — OFF"; b.TextColor3=Color3.fromRGB(235,228,255)
-            b.TextSize=13; b.Font=Enum.Font.GothamBold; b.Parent=p; corner(b,9)
-            openBtnRef=b
-            b.MouseButton1Click:Connect(function()
-                if not autoOpenEnabled then
-                    local limit=tonumber(autoOpenBox.Text)
-                    if limit==nil or limit<=0 then return end
-                    autoOpenLimit=math.floor(limit); autoOpenEnabled=true
-                    b.Text="Auto Abertura — ON ("..autoOpenLimit..")"; b.BackgroundColor3=Color3.fromRGB(30,100,50)
-                    capsStartAutoOpenLoop()
-                else
-                    autoOpenEnabled=false
-                    b.Text="Auto Abertura — OFF"; b.BackgroundColor3=Color3.fromRGB(80,35,35)
-                end
-            end)
-        end
-        buildOpenBtn()
+        local b=Instance.new("TextButton"); b.Size=UDim2.new(1,0,0,38); b.Position=UDim2.fromOffset(0,y)
+        b.BackgroundColor3=Color3.fromRGB(80,35,35); b.BorderSizePixel=0
+        b.Text="Auto Abertura — OFF"; b.TextColor3=Color3.fromRGB(235,228,255)
+        b.TextSize=13; b.Font=Enum.Font.GothamBold; b.Parent=p; corner(b,9)
+        b.MouseButton1Click:Connect(function()
+            if not autoOpenEnabled then
+                local limit=tonumber(autoOpenBox.Text)
+                if limit==nil or limit<=0 then return end
+                autoOpenLimit=math.floor(limit); autoOpenEnabled=true
+                b.Text="Auto Abertura — ON ("..autoOpenLimit..")"; b.BackgroundColor3=Color3.fromRGB(30,100,50)
+                capsStartAutoOpenLoop()
+            else
+                autoOpenEnabled=false
+                b.Text="Auto Abertura — OFF"; b.BackgroundColor3=Color3.fromRGB(80,35,35)
+            end
+        end)
         y=y+44
     end
-
     y=y+4
 end
 
@@ -1275,7 +1452,7 @@ do
         {key="NOTIF_INVASION_END",  label="Invasion terminou"},
         {key="NOTIF_ENTROU",        label="Entrou em invasion"},
         {key="NOTIF_TP",            label="Auto TP na torre"},
-        {key="NOTIF_TREASURE",      label="Cavada do tesouro"},
+        {key="NOTIF_TREASURE",      label="Cavada do tesouro (item)"},
     }
     local notifVars={
         NOTIF_INVASION_DISP =function(v) NOTIF_INVASION_DISP=v end,

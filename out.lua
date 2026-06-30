@@ -1,10 +1,6 @@
 -- ============================================================
---  lz3s Invasion Menu (v2) — CORRIGIDO
---  Fixes:
---   [1] Webhook: agora dispara ao fim da invasion (boss morto / opções aparecem),
---       não ao clicar em Continue.
---   [2] Auto TP: mais robusto — tenta Root primeiro, delay de carregamento,
---       polling via workspace.World.Players como redundância.
+--  lz3s Invasion Menu (v2)
+--  Abas: INVASION | TREASURE | CAPSULAS | CONFIG | WEBHOOK
 -- ============================================================
 
 local Players           = game:GetService("Players")
@@ -323,44 +319,22 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
---  AUTO TP  *** CORRIGIDO ***
---
---  Mudanças:
---  1) buscarPosTurret tenta o filho "Root" primeiro (visível
---     no Explorer: Main Base Turret > Root).
---  2) executarTp aguarda 3s para o mapa e personagem carregarem
---     antes de teleportar, evitando o bug de sair da ilha.
---  3) Polling via workspace.World.Players como redundância ao
---     ChildAdded, garantindo que o TP ocorra mesmo que o evento
---     chegue antes do modelo estar totalmente pronto.
+--  AUTO TP
 -- ============================================================
 local tpFeitoIds = {}
 
 local function buscarPosTurret(invasionFolder)
     local turret = invasionFolder:FindFirstChild("Main Base Turret")
     if turret == nil then
-        local ok, result = pcall(function()
-            return invasionFolder:WaitForChild("Main Base Turret", 10)
-        end)
+        local ok, result = pcall(function() return invasionFolder:WaitForChild("Main Base Turret", 15) end)
         if ok and result then turret = result end
     end
-    if turret == nil then
-        return nil, "Main Base Turret nao encontrado em " .. invasionFolder.Name
-    end
-
+    if turret == nil then return nil, "Main Base Turret nao encontrado em "..invasionFolder.Name end
     if turret:IsA("Model") then
-        -- [FIX] Tenta "Root" primeiro — filho direto visível no Explorer
-        local root = turret:FindFirstChild("Root")
-        if root and root:IsA("BasePart") then
-            return root.Position, nil
-        end
-        -- Tenta PrimaryPart
         local pp = turret.PrimaryPart
         if pp then return pp.Position, nil end
-        -- Qualquer BasePart descendente
         local bp = turret:FindFirstChildWhichIsA("BasePart", true)
         if bp then return bp.Position, nil end
-        -- GetPivot como último recurso
         local ok2, pivot = pcall(function() return turret:GetPivot().Position end)
         if ok2 then return pivot, nil end
         return nil, "Main Base Turret sem BasePart"
@@ -369,62 +343,30 @@ local function buscarPosTurret(invasionFolder)
     else
         local bp = turret:FindFirstChildWhichIsA("BasePart", true)
         if bp then return bp.Position, nil end
-        return nil, "Main Base Turret tipo desconhecido: " .. turret.ClassName
+        return nil, "Main Base Turret tipo desconhecido: "..turret.ClassName
     end
 end
 
--- Executa TP de forma segura com delay de carregamento
-local function executarTp(nome, invasionFolder)
+local function tentarTpParaInvasion(filho)
+    local nome = filho.Name
+    if not nome:match("^invasion%-.") then return end
     if tpFeitoIds[nome] then return end
     if not AUTO_TP then return end
-    tpFeitoIds[nome] = true
-
     task.spawn(function()
-        logf("Auto TP: entrada detectada (" .. nome .. "), aguardando 3s para carregar...")
-
-        -- [FIX] Aguarda mapa e personagem carregarem completamente
-        task.wait(3)
-
-        if not AUTO_TP then
-            tpFeitoIds[nome] = nil
-            return
-        end
-
-        -- Verifica se o modelo ainda existe (invasion não terminou durante o delay)
-        if not invasionFolder or not invasionFolder.Parent then
-            logf("Auto TP: modelo " .. nome .. " desapareceu antes do TP")
-            tpFeitoIds[nome] = nil
-            return
-        end
-
-        -- Aguarda character + HumanoidRootPart
+        logf("Auto TP: detectei "..nome..", aguardando turret...")
+        local pos, err = buscarPosTurret(filho)
+        if pos == nil then logf("Auto TP ERRO: "..tostring(err)); return end
+        if not AUTO_TP then return end
         local char = Players.LocalPlayer.Character
-        for _ = 1, 100 do
-            if char and char:FindFirstChild("HumanoidRootPart") then break end
-            task.wait(0.1)
-            char = Players.LocalPlayer.Character
-        end
-
         if char == nil then
-            logf("Auto TP: character nao encontrado")
-            tpFeitoIds[nome] = nil
-            return
+            for _ = 1, 80 do task.wait(0.1); char = Players.LocalPlayer.Character; if char then break end end
         end
+        if char == nil then return end
         local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp == nil then
-            tpFeitoIds[nome] = nil
-            return
-        end
-
-        local pos, err = buscarPosTurret(invasionFolder)
-        if pos == nil then
-            logf("Auto TP ERRO: " .. tostring(err))
-            tpFeitoIds[nome] = nil
-            return
-        end
-
+        if hrp == nil then return end
+        tpFeitoIds[nome] = true
         hrp.CFrame = CFrame.new(pos + Vector3.new(0, 10, 0))
-        logf("Auto TP: teleportado para " .. nome)
+        logf("Auto TP: teleportado para "..nome)
         if NOTIF_TP then criarNotif("tp", "Auto TP", "Teleportado para a torre!", 4) end
     end)
 end
@@ -435,53 +377,11 @@ task.spawn(function()
         local world = workspace:WaitForChild("World", 30)
         mapFolder = world:WaitForChild("Map", 30)
     end)
-    if not ok or mapFolder == nil then
-        warn("[lz3s] Auto TP: workspace.World.Map nao encontrado")
-        return
-    end
-
-    -- Verifica modelos já existentes (caso o script rode mid-invasion)
-    for _, filho in ipairs(mapFolder:GetChildren()) do
-        if filho.Name:match("^invasion%-") then
-            executarTp(filho.Name, filho)
-        end
-    end
-
-    -- ChildAdded: novo modelo de invasion adicionado
-    mapFolder.ChildAdded:Connect(function(filho)
-        if filho.Name:match("^invasion%-") then
-            executarTp(filho.Name, filho)
-        end
-    end)
-
-    -- ChildRemoved: limpa o id para permitir TP em futuras invasions
+    if not ok or mapFolder == nil then warn("[lz3s] Auto TP: workspace.World.Map nao encontrado"); return end
+    for _, filho in ipairs(mapFolder:GetChildren()) do tentarTpParaInvasion(filho) end
+    mapFolder.ChildAdded:Connect(function(filho) tentarTpParaInvasion(filho) end)
     mapFolder.ChildRemoved:Connect(function(filho)
-        if tpFeitoIds[filho.Name] then
-            tpFeitoIds[filho.Name] = nil
-            logf("Auto TP: invasion " .. filho.Name .. " removida, id liberado")
-        end
-    end)
-
-    -- [FIX] Polling via workspace.World.Players como redundância
-    -- Detecta o jogador dentro da invasion mesmo que ChildAdded chegue atrasado
-    task.spawn(function()
-        while true do
-            task.wait(2)
-            if not AUTO_TP then continue end
-
-            local worldNode     = workspace:FindFirstChild("World")
-            local playersFolder = worldNode and worldNode:FindFirstChild("Players")
-            if not playersFolder then continue end
-            if not playersFolder:FindFirstChild(Players.LocalPlayer.Name) then continue end
-
-            -- Jogador está em alguma invasion — encontra o model correspondente
-            for _, filho in ipairs(mapFolder:GetChildren()) do
-                if filho.Name:match("^invasion%-") then
-                    executarTp(filho.Name, filho)
-                    break
-                end
-            end
-        end
+        if tpFeitoIds[filho.Name] then tpFeitoIds[filho.Name] = nil end
     end)
 end)
 
@@ -571,7 +471,7 @@ local function iniciarLoopTreasure()
                 if not avisouSemPas then
                     avisouSemPas = true
                     logf("Auto Treasure: sem pas")
-                    criarNotif("treasure", "Sem Pas!", "Consiga mais pass para cavar.", 5)
+                    criarNotif("treasure", "Sem Pas!", "Compre mais pas para continuar cavando.", 5)
                 end
                 task.wait(CHECK_INTERVAL_SEM_PA)
             end
@@ -1037,124 +937,132 @@ task.spawn(function()
 end)
 
 -- ============================================================
---  Watcher principal: invasion (notifs + webhook)  *** CORRIGIDO ***
+--  Watcher principal: invasion (notifs + webhook)
 --
---  Problema original:
---    O charm subscribe pode batcher a transição state→"won" junto
---    com invasion→nil num único ciclo, fazendo o fallback do nil
---    disparar a webhook no momento errado (ao clicar Continue).
+--  *** LÓGICA DEFINITIVA — baseada no model do workspace ***
 --
---  Solução aplicada:
---    1) Poll via Heartbeat a cada 0.5s que detecta a mudança de
---       estado ANTES do subscribe, garantindo que o webhook seja
---       enviado assim que as opções Continue/Replay aparecerem.
---    2) O subscribe ainda existe para notificações e rastreamento,
---       mas o envio da webhook é controlado pelo poll.
---    3) O fallback do nil só envia se o poll também não enviou
---       (proteção dupla), e nunca envia duas vezes para o mesmo id.
+--  Descoberta confirmada pelo usuário: o model da invasion em
+--  workspace.World.Map["invasion-<uuid>"] só é DESTRUÍDO quando
+--  a invasion REALMENTE termina (boss morto, tela com as 3
+--  opções Continue/Replay/Aceitar aparece). Isso acontece ANTES
+--  do jogador clicar em qualquer opção — diferente de
+--  invasion.state, que só muda quando o jogador sai (Continue).
+--
+--  Estratégia:
+--  1. Quando entra numa invasion, guarda o invasion.id E referencia
+--     o model em workspace.World.Map["invasion-"..id]
+--  2. Conecta um listener .AncestryChanged (ou ChildRemoved no pai)
+--     nesse model específico
+--  3. Quando o model é destruído → invasion ACABOU DE VERDADE →
+--     envia o webhook AQUI, não quando invasion==nil no store
+--  4. invasion==nil no store (ao clicar Continue) NÃO dispara mais
+--     o webhook — só faz o cleanup de notificação, sem reenviar
 -- ============================================================
 
--- Estados finais que indicam que a invasion terminou
-local INVASION_FINAL_STATES = {
-    ["won"]         = true,
-    ["defeat"]      = true,
-    ["cancelled"]   = true,
-    ["out_of_time"] = true,
-    -- Aliases comuns — adicione aqui se o jogo usar outro nome
-    ["victory"]     = true,
-    ["finished"]    = true,
-    ["complete"]    = true,
-    ["ended"]       = true,
-}
-
-local whEnviadoParaInvasion = nil   -- id da ultima invasion que enviou webhook
+local whEnviadoParaInvasion = nil   -- id da última invasion que já mandou webhook
 local lastInvasionId        = nil
-local lastState             = nil
 local startNotifiedId       = nil
 local lastStarQtd           = 0
+local invasionModelConn     = nil   -- conexão ativa do listener no model atual
 
--- [FIX 1] Poll via Heartbeat — detecta estado final em tempo real
--- Isso roda a cada ~0.5s e captura a mudança state→"won" antes
--- que o charm possa batcher com invasion→nil.
-local pollTick         = 0
-local pollLastState    = nil
-local pollLastId       = nil
+-- Lista de callbacks externos (para _G.__lz3s_invasionSubscribe)
+local invasionExternalCallbacks = {}
+_G.__lz3s_invasionSubscribe = function(callback)
+    table.insert(invasionExternalCallbacks, callback)
+    print("[lz3s] Script externo conectado ao watcher de invasion.")
+end
 
-RunService.Heartbeat:Connect(function()
-    -- Roda a cada ~0.5s para não sobrecarregar
-    if tick() - pollTick < 0.5 then return end
-    pollTick = tick()
+-- Dispara o webhook + notificação de encerramento UMA VEZ por invasion.id
+local function finalizarInvasion(invasionId, snapshotInvasion, motivo)
+    if whEnviadoParaInvasion == invasionId then return end
+    whEnviadoParaInvasion = invasionId
+    logf("Invasion " .. tostring(invasionId):sub(1,8) .. " finalizada (" .. motivo .. ")")
 
-    local invasion = getInvasionByPlayer(USER_KEY)
-    if invasion == nil then
-        pollLastState = nil
-        pollLastId    = nil
-        return
-    end
-
-    -- Reseta rastreamento se for uma nova invasion
-    if invasion.id ~= pollLastId then
-        pollLastId    = invasion.id
-        pollLastState = invasion.state
-        return
-    end
-
-    local state = invasion.state
-    -- Só age se o estado mudou
-    if state == pollLastState then return end
-    pollLastState = state
-
-    -- Estado final detectado! Envia webhook antes do jogador sair.
-    if INVASION_FINAL_STATES[state] and whEnviadoParaInvasion ~= invasion.id then
-        whEnviadoParaInvasion = invasion.id
-        logf("Webhook Poll: estado final detectado — " .. tostring(state))
-
-        -- Pequeno delay (0.5s) para o servidor gravar os drops finais
-        local snapId      = invasion.id
-        local snapInvasion = invasion
-        task.delay(0.5, function()
-            -- Tenta pegar dados atualizados; usa snapshot como fallback
-            local inv = getInvasionByPlayer(USER_KEY)
-            if inv == nil or inv.id ~= snapId then inv = snapInvasion end
-            _lastInvasionForWH = inv
-            wh_enviarRelatorioInvasion(inv)
-        end)
-    end
-end)
-
--- Subscribe: notificações + rastreamento (webhook delegado ao poll acima)
-subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), function(invasion)
-    if invasion == nil then
-        -- Fallback de segurança: envia webhook se o poll não enviou
-        -- (ex.: jogo removeu player sem passar por estado final)
-        if lastInvasionId ~= nil then
-            if NOTIF_INVASION_END then
-                local msg = "A invasion terminou."
-                if lastStarQtd > 0 then
-                    msg = msg.." Ganhou: "..lastStarQtd
-                    local total = getStarRemnantTotal()
-                    if total ~= nil then msg = msg.." | Total: "..total end
-                end
-                criarNotif("finish","Invasion encerrada",msg,7)
-            end
-
-            -- [FIX] Só envia webhook aqui se o poll NÃO enviou ainda
-            if _lastInvasionForWH and whEnviadoParaInvasion ~= lastInvasionId then
-                logf("Webhook Fallback: enviando (estado final nao detectado pelo poll)")
-                whEnviadoParaInvasion = lastInvasionId
-                wh_enviarRelatorioInvasion(_lastInvasionForWH)
-            end
+    if NOTIF_INVASION_END then
+        local msg = "A invasion terminou."
+        local total = getStarRemnantTotal()
+        if lastStarQtd > 0 then
+            msg = msg .. " Ganhou: " .. lastStarQtd
+            if total ~= nil then msg = msg .. " | Total: " .. total end
         end
+        criarNotif("finish", "Invasion encerrada", msg, 7)
+    end
 
+    -- Pequeno delay para o servidor consolidar os drops finais antes do relatório
+    task.delay(1, function()
+        wh_enviarRelatorioInvasion(snapshotInvasion)
+    end)
+end
+
+-- Conecta o listener de destruição no model físico da invasion
+local function conectarListenerModel(invasionId)
+    if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
+
+    local mapFolder
+    local ok = pcall(function()
+        mapFolder = workspace:WaitForChild("World"):WaitForChild("Map")
+    end)
+    if not ok or mapFolder == nil then
+        warn("[lz3s] Webhook: nao foi possivel acessar workspace.World.Map")
+        return
+    end
+
+    local modelName = "invasion-" .. tostring(invasionId)
+    local model = mapFolder:FindFirstChild(modelName)
+    if model == nil then
+        -- Aguarda até 10s o model carregar (pode levar um instante após entrar)
+        local ok2, result = pcall(function() return mapFolder:WaitForChild(modelName, 10) end)
+        if ok2 then model = result end
+    end
+
+    if model == nil then
+        warn("[lz3s] Webhook: model " .. modelName .. " nao encontrado para monitorar.")
+        return
+    end
+
+    logf("Webhook: monitorando destruicao de " .. modelName)
+
+    -- AncestryChanged dispara quando o model é destruído (Parent vira nil)
+    invasionModelConn = model.AncestryChanged:Connect(function(_, newParent)
+        if newParent == nil then
+            -- Model foi destruído = invasion terminou DE VERDADE
+            finalizarInvasion(invasionId, _lastInvasionForWH, "model destruido")
+            if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
+        end
+    end)
+end
+
+subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), function(invasion)
+    -- Notifica callbacks externos (debug/teste)
+    for _, cb in ipairs(invasionExternalCallbacks) do
+        task.spawn(function() pcall(cb, invasion) end)
+    end
+
+    if invasion == nil then
+        -- Player saiu do store (clicou Continue, ou desconectou).
+        -- NÃO envia webhook aqui — isso já foi feito pelo listener
+        -- do model quando o model foi destruído. Só limpa o estado.
+        if lastInvasionId ~= nil and invasionModelConn ~= nil then
+            -- Caso raro: saiu do store mas o model ainda não foi destruído
+            -- (ex: kickado, erro). Fallback de segurança após 3s.
+            local snapId = lastInvasionId
+            local snap   = _lastInvasionForWH
+            task.delay(3, function()
+                if whEnviadoParaInvasion ~= snapId then
+                    logf("Webhook: fallback de seguranca (model nao destruido a tempo)")
+                    finalizarInvasion(snapId, snap, "fallback timeout")
+                end
+            end)
+        end
+        if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
         lastInvasionId     = nil
-        lastState          = nil
         startNotifiedId    = nil
         lastStarQtd        = 0
         _lastInvasionForWH = nil
         return
     end
 
-    -- Atualiza snapshot sempre (usado pelo fallback)
+    -- Atualiza snapshot sempre (drops mais recentes para o relatório)
     _lastInvasionForWH = invasion
     lastStarQtd = somarStarRemnant(invasion)
 
@@ -1163,45 +1071,15 @@ subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), functio
         lastInvasionId = invasion.id
         wh_registrarInicioInvasion()
         if NOTIF_ENTROU then
-            criarNotif("entrou","Entrou na invasion",invasion.name or "Dark Matter Invasion",4)
+            criarNotif("entrou", "Entrou na invasion", invasion.name or "Dark Matter Invasion", 4)
         end
-    end
-
-    local state = invasion.state
-
-    -- Notificação de resultado (separada do envio de webhook)
-    if INVASION_FINAL_STATES[state] then
-        if NOTIF_INVASION_END and startNotifiedId ~= invasion.id.."_end" then
-            startNotifiedId = invasion.id.."_end"
-            local resultTxt = ({
-                won         = "Vitoria!",
-                victory     = "Vitoria!",
-                finished    = "Vitoria!",
-                complete    = "Vitoria!",
-                ended       = "Encerrada.",
-                defeat      = "Derrota.",
-                cancelled   = "Cancelada.",
-                out_of_time = "Tempo esgotado.",
-            })[state] or "Encerrada."
-            local msg = resultTxt
-            if lastStarQtd > 0 then
-                msg = msg.." Ganhou: "..lastStarQtd
-                local total = getStarRemnantTotal()
-                if total ~= nil then msg = msg.." | Total: "..total end
-            end
-            criarNotif("finish","Invasion encerrada",msg,7)
+        if NOTIF_INVASION_START and startNotifiedId ~= invasion.id then
+            startNotifiedId = invasion.id
+            criarNotif("start", "Invasion comecou", "Boa sorte na batalha.", 4)
         end
-    end
 
-    -- Notificação de início (saída do lobby)
-    if state ~= lastState then
-        if lastState == "lobby" and state ~= "lobby" and not INVASION_FINAL_STATES[state] then
-            if NOTIF_INVASION_START and startNotifiedId ~= invasion.id then
-                startNotifiedId = invasion.id
-                criarNotif("start","Invasion comecou","Boa sorte na batalha.",4)
-            end
-        end
-        lastState = state
+        -- Conecta o listener de destruição no model desta invasion
+        task.spawn(function() conectarListenerModel(invasion.id) end)
     end
 end)
 
@@ -1945,6 +1823,4 @@ task.defer(function()
     if dados~=nil then _G.__lz3s_aplicarConfig(dados); logf("Config carregada automaticamente.") end
 end)
 
-print("[lz3s Invasion v2 - CORRIGIDO] Carregado! Keybind: RightShift + K")
-print("  FIX 1: Webhook agora dispara ao fim da invasion (boss morto), nao ao clicar Continue")
-print("  FIX 2: Auto TP com delay de carregamento + polling workspace.World.Players + busca Root")
+print("[lz3s Invasion v2] Carregado! Keybind: RightShift + K | Abas: Invasion / Treasure / Capsulas / Config / Webhook")

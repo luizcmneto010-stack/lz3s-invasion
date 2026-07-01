@@ -1,5 +1,5 @@
 -- ============================================================
---  lz3s Invasion Menu (v2 - webhook corrigido)
+--  lz3s Invasion Menu (v2)
 --  Abas: INVASION | TREASURE | CAPSULAS | CONFIG | WEBHOOK
 -- ============================================================
 
@@ -939,91 +939,147 @@ end)
 -- ============================================================
 --  Watcher principal: invasion (notifs + webhook)
 --
---  LÓGICA SIMPLES, EM LOOP:
---  1. Fica em loop tentando pegar a invasion atual do jogador
---     (getInvasionByPlayer). Enquanto nao tiver nenhuma, so espera.
---  2. Ao achar uma invasion, pega o id e fica em loop tentando achar
---     o model dela em workspace.World.Map["invasion-"..id].
---  3. Ao achar o model, fica em loop MONITORANDO ele (checando o
---     Parent a cada segundo, e atualizando o snapshot de drops).
---  4. Quando o model.Parent vira nil (foi excluido = invasion
---     acabou de verdade), manda o relatorio pro webhook.
---  5. Espera o jogador sair do store, e volta pro passo 1.
+--  *** LÓGICA DEFINITIVA — baseada no model do workspace ***
 --
---  So manda o webhook quando o MODEL da invasion e excluido.
---  Nunca depende de clicar em Continue.
+--  Descoberta confirmada pelo usuário: o model da invasion em
+--  workspace.World.Map["invasion-<uuid>"] só é DESTRUÍDO quando
+--  a invasion REALMENTE termina (boss morto, tela com as 3
+--  opções Continue/Replay/Aceitar aparece). Isso acontece ANTES
+--  do jogador clicar em qualquer opção — diferente de
+--  invasion.state, que só muda quando o jogador sai (Continue).
+--
+--  Estratégia:
+--  1. Quando entra numa invasion, guarda o invasion.id E referencia
+--     o model em workspace.World.Map["invasion-"..id]
+--  2. Conecta um listener .AncestryChanged (ou ChildRemoved no pai)
+--     nesse model específico
+--  3. Quando o model é destruído → invasion ACABOU DE VERDADE →
+--     envia o webhook AQUI, não quando invasion==nil no store
+--  4. invasion==nil no store (ao clicar Continue) NÃO dispara mais
+--     o webhook — só faz o cleanup de notificação, sem reenviar
 -- ============================================================
 
-local lastStarQtd       = 0
-local _lastInvasionForWH = nil
+local whEnviadoParaInvasion = nil   -- id da última invasion que já mandou webhook
+local lastInvasionId        = nil
+local startNotifiedId       = nil
+local lastStarQtd           = 0
+local invasionModelConn     = nil   -- conexão ativa do listener no model atual
 
-task.spawn(function()
-    while true do
-        -- PASSO 1: fica em loop tentando pegar a invasion do jogador
-        local invasion = getInvasionByPlayer(USER_KEY)
-        while invasion == nil do
-            task.wait(1)
-            invasion = getInvasionByPlayer(USER_KEY)
+-- Lista de callbacks externos (para _G.__lz3s_invasionSubscribe)
+local invasionExternalCallbacks = {}
+_G.__lz3s_invasionSubscribe = function(callback)
+    table.insert(invasionExternalCallbacks, callback)
+    print("[lz3s] Script externo conectado ao watcher de invasion.")
+end
+
+-- Dispara o webhook + notificação de encerramento UMA VEZ por invasion.id
+local function finalizarInvasion(invasionId, snapshotInvasion, motivo)
+    if whEnviadoParaInvasion == invasionId then return end
+    whEnviadoParaInvasion = invasionId
+    logf("Invasion " .. tostring(invasionId):sub(1,8) .. " finalizada (" .. motivo .. ")")
+
+    if NOTIF_INVASION_END then
+        local msg = "A invasion terminou."
+        local total = getStarRemnantTotal()
+        if lastStarQtd > 0 then
+            msg = msg .. " Ganhou: " .. lastStarQtd
+            if total ~= nil then msg = msg .. " | Total: " .. total end
         end
+        criarNotif("finish", "Invasion encerrada", msg, 7)
+    end
 
-        local invasionId = invasion.id
-        _lastInvasionForWH = invasion
-        lastStarQtd = somarStarRemnant(invasion)
+    -- Pequeno delay para o servidor consolidar os drops finais antes do relatório
+    task.delay(1, function()
+        wh_enviarRelatorioInvasion(snapshotInvasion)
+    end)
+end
+
+-- Conecta o listener de destruição no model físico da invasion
+local function conectarListenerModel(invasionId)
+    if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
+
+    local mapFolder
+    local ok = pcall(function()
+        mapFolder = workspace:WaitForChild("World"):WaitForChild("Map")
+    end)
+    if not ok or mapFolder == nil then
+        warn("[lz3s] Webhook: nao foi possivel acessar workspace.World.Map")
+        return
+    end
+
+    local modelName = "invasion-" .. tostring(invasionId)
+    local model = mapFolder:FindFirstChild(modelName)
+    if model == nil then
+        -- Aguarda até 10s o model carregar (pode levar um instante após entrar)
+        local ok2, result = pcall(function() return mapFolder:WaitForChild(modelName, 10) end)
+        if ok2 then model = result end
+    end
+
+    if model == nil then
+        warn("[lz3s] Webhook: model " .. modelName .. " nao encontrado para monitorar.")
+        return
+    end
+
+    logf("Webhook: monitorando destruicao de " .. modelName)
+
+    -- AncestryChanged dispara quando o model é destruído (Parent vira nil)
+    invasionModelConn = model.AncestryChanged:Connect(function(_, newParent)
+        if newParent == nil then
+            -- Model foi destruído = invasion terminou DE VERDADE
+            finalizarInvasion(invasionId, _lastInvasionForWH, "model destruido")
+            if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
+        end
+    end)
+end
+
+subscribe(computed(function() return getInvasionByPlayer(USER_KEY) end), function(invasion)
+    -- Notifica callbacks externos (debug/teste)
+    for _, cb in ipairs(invasionExternalCallbacks) do
+        task.spawn(function() pcall(cb, invasion) end)
+    end
+
+    if invasion == nil then
+        -- Player saiu do store (clicou Continue, ou desconectou).
+        -- NÃO envia webhook aqui — isso já foi feito pelo listener
+        -- do model quando o model foi destruído. Só limpa o estado.
+        if lastInvasionId ~= nil and invasionModelConn ~= nil then
+            -- Caso raro: saiu do store mas o model ainda não foi destruído
+            -- (ex: kickado, erro). Fallback de segurança após 3s.
+            local snapId = lastInvasionId
+            local snap   = _lastInvasionForWH
+            task.delay(3, function()
+                if whEnviadoParaInvasion ~= snapId then
+                    logf("Webhook: fallback de seguranca (model nao destruido a tempo)")
+                    finalizarInvasion(snapId, snap, "fallback timeout")
+                end
+            end)
+        end
+        if invasionModelConn then invasionModelConn:Disconnect(); invasionModelConn = nil end
+        lastInvasionId     = nil
+        startNotifiedId    = nil
+        lastStarQtd        = 0
+        _lastInvasionForWH = nil
+        return
+    end
+
+    -- Atualiza snapshot sempre (drops mais recentes para o relatório)
+    _lastInvasionForWH = invasion
+    lastStarQtd = somarStarRemnant(invasion)
+
+    -- Nova invasion detectada
+    if invasion.id ~= lastInvasionId then
+        lastInvasionId = invasion.id
         wh_registrarInicioInvasion()
-        logf("Invasion detectada: " .. tostring(invasionId):sub(1,8))
-
         if NOTIF_ENTROU then
             criarNotif("entrou", "Entrou na invasion", invasion.name or "Dark Matter Invasion", 4)
         end
-        if NOTIF_INVASION_START then
+        if NOTIF_INVASION_START and startNotifiedId ~= invasion.id then
+            startNotifiedId = invasion.id
             criarNotif("start", "Invasion comecou", "Boa sorte na batalha.", 4)
         end
 
-        -- PASSO 2: fica em loop tentando achar o model dessa invasion no mapa
-        local mapFolder
-        pcall(function()
-            mapFolder = workspace:WaitForChild("World"):WaitForChild("Map")
-        end)
-
-        local modelName = "invasion-" .. tostring(invasionId)
-        local model = nil
-        if mapFolder then
-            while model == nil and getInvasionByPlayer(USER_KEY) ~= nil do
-                model = mapFolder:FindFirstChild(modelName)
-                if model == nil then task.wait(1) end
-            end
-        end
-
-        if model ~= nil then
-            -- PASSO 3: fica em loop monitorando o model ate ele ser excluido
-            while model.Parent ~= nil do
-                local invAtual = getInvasionByPlayer(USER_KEY)
-                if invAtual ~= nil then
-                    _lastInvasionForWH = invAtual
-                    lastStarQtd = somarStarRemnant(invAtual)
-                end
-                task.wait(1)
-            end
-
-            -- PASSO 4: model foi excluido = invasion acabou de verdade -> manda webhook
-            logf("Invasion " .. tostring(invasionId):sub(1,8) .. " finalizada (model excluido)")
-            if NOTIF_INVASION_END then
-                local msg = "A invasion terminou."
-                local total = getStarRemnantTotal()
-                if lastStarQtd > 0 then
-                    msg = msg .. " Ganhou: " .. lastStarQtd
-                    if total ~= nil then msg = msg .. " | Total: " .. total end
-                end
-                criarNotif("finish", "Invasion encerrada", msg, 7)
-            end
-            task.wait(1) -- da tempo do servidor consolidar os drops finais
-            wh_enviarRelatorioInvasion(_lastInvasionForWH)
-        else
-            logf("Invasion " .. tostring(invasionId):sub(1,8) .. ": model nunca apareceu, pulando relatorio")
-        end
-
-        -- PASSO 5: espera sair completamente do store antes de procurar a proxima
-        while getInvasionByPlayer(USER_KEY) ~= nil do task.wait(1) end
+        -- Conecta o listener de destruição no model desta invasion
+        task.spawn(function() conectarListenerModel(invasion.id) end)
     end
 end)
 
@@ -1640,7 +1696,7 @@ do
     btnSalvarUrl.MouseButton1Click:Connect(function()
         local url=box.Text:gsub("%s","")
         if url=="" then mostrarWhStatus("URL vazia.",false); return end
-        if not (url:match("^https://discord%.com/api/webhooks/") or url:match("^https://discordapp%.com/api/webhooks/")) then
+        if not url:match("^https://discord%.com/api/webhooks/") then
             mostrarWhStatus("URL invalida. Use Discord webhook.",false); return
         end
         WEBHOOK_URL=url; atualizarDotUrl(); salvarConfig()
